@@ -133,6 +133,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
 
     steps:
       - name: Download all artifacts
@@ -142,9 +144,9 @@ jobs:
 
       - name: Rename binaries
         run: |
-          mv artifacts/iptvshows-linux/iptvshows    artifacts/iptvshows-linux
+          mv artifacts/iptvshows-linux/iptvshows       artifacts/iptvshows-linux
           mv artifacts/iptvshows-windows/iptvshows.exe artifacts/iptvshows-windows.exe
-          mv artifacts/iptvshows-macos/iptvshows    artifacts/iptvshows-macos
+          mv artifacts/iptvshows-macos/iptvshows       artifacts/iptvshows-macos
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -154,3 +156,5 @@ jobs:
             artifacts/iptvshows-windows.exe
             artifacts/iptvshows-macos
           generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
