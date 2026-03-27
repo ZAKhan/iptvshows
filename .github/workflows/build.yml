@@ -144,17 +144,17 @@ jobs:
 
       - name: Rename binaries
         run: |
-          mv artifacts/iptvshows-linux/iptvshows       artifacts/iptvshows-linux
-          mv artifacts/iptvshows-windows/iptvshows.exe artifacts/iptvshows-windows.exe
-          mv artifacts/iptvshows-macos/iptvshows       artifacts/iptvshows-macos
+          mv artifacts/iptvshows-linux/iptvshows       iptvshows-linux
+          mv artifacts/iptvshows-windows/iptvshows.exe iptvshows-windows.exe
+          mv artifacts/iptvshows-macos/iptvshows       iptvshows-macos
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/iptvshows-linux
-            artifacts/iptvshows-windows.exe
-            artifacts/iptvshows-macos
+            iptvshows-linux
+            iptvshows-windows.exe
+            iptvshows-macos
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
