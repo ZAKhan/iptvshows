@@ -8,3 +8,4 @@ dist/
 binary/
 *.spec
 .claude/
+.worktrees/
