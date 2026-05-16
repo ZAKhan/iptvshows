@@ -1,11 +1,13 @@
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QApplication,
     QListWidget, QListWidgetItem, QLineEdit, QMenu, QPushButton,
+    QFrame, QComboBox, QCompleter,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 
 from ui.workers import ApiWorker, PosterPrefetcher
-from ui.widgets import ChannelListView, LoadingLabel
+from ui.widgets import ChannelListView, LoadingLabel, SearchField
+from ui.anim import LiveDotPulse
 import core.database as db
 import core.player as player
 import api.m3u as m3u
@@ -22,117 +24,182 @@ class LiveTvWidget(QWidget):
         self._syncing = False
 
         self._build_ui()
-        self._load_from_db()
+        if self.api is not None:
+            self._load_from_db()
 
     def _build_ui(self):
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Category sidebar
-        left = QWidget()
-        left.setFixedWidth(200)
+        if self.api is None:
+            empty = QLabel("No server connected")
+            empty.setObjectName("PlayerInfo")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            root.addWidget(empty)
+            return
+
+        # ── Channel list panel (left) ─────────────────────────────────────────
+        left = QFrame()
+        left.setObjectName("SidebarPanel")
+        left.setFixedWidth(320)
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.setSpacing(0)
-        hdr = QLabel("  Categories")
-        hdr.setFixedHeight(36)
-        hdr.setStyleSheet(
-            "background:#111;color:#888;font-size:11px;"
-            "text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid #222;"
-        )
-        ll.addWidget(hdr)
 
-        # Fix 12: category search
-        self._cat_search = QLineEdit()
-        self._cat_search.setPlaceholderText("Filter categories…")
-        self._cat_search.setFixedHeight(28)
-        self._cat_search.setStyleSheet(
-            "background:#1a1a1a;border:none;border-bottom:1px solid #222;"
-            "color:#ccc;padding:0 8px;font-size:11px;"
-        )
-        self._cat_search.textChanged.connect(self._filter_categories)
-        ll.addWidget(self._cat_search)
+        # Search + Sync header
+        top = QWidget()
+        top.setObjectName("PageHeader")
+        top.setFixedHeight(52)
+        tl = QHBoxLayout(top)
+        tl.setContentsMargins(12, 8, 12, 8)
+        tl.setSpacing(8)
 
-        self._cat_list = QListWidget()
-        self._cat_list.setObjectName("CategoryList")
-        self._cat_list.currentRowChanged.connect(self._on_cat_changed)
-        ll.addWidget(self._cat_list)
+        self._search = SearchField("Search channels…")
+        self._search.textChanged.connect(self._filter)
+        tl.addWidget(self._search, stretch=1)
+
+        ll.addWidget(top)
+
+        # Category dropdown
+        cat_wrap = QWidget()
+        cat_wrap.setObjectName("PageHeader")
+        cwl = QHBoxLayout(cat_wrap)
+        cwl.setContentsMargins(12, 6, 12, 6)
+        cwl.setSpacing(0)
+        self._cat_combo = QComboBox()
+        self._cat_combo.setMinimumHeight(38)
+        self._cat_combo.setMaxVisibleItems(20)
+        self._cat_combo.setEditable(True)
+        self._cat_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._cat_combo.lineEdit().setPlaceholderText("Search categories…")
+        self._cat_combo.completer().setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self._cat_combo.completer().setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._cat_combo.completer().setFilterMode(Qt.MatchFlag.MatchContains)
+        self._cat_combo.setStyleSheet(
+            "QComboBox { background:#18181d; border:1px solid #232329; border-radius:8px;"
+            " padding:4px 28px 4px 12px; color:#f1efe9; font-size:13px; }"
+            "QComboBox:hover { border-color:#2e2e36; }"
+            "QComboBox:focus { border-color:#ffb547; }"
+            "QComboBox QLineEdit { background:transparent; border:none; color:#f1efe9; padding:0; }"
+            "QComboBox::drop-down { subcontrol-origin:padding; subcontrol-position:center right;"
+            " width:24px; border:none; }"
+            "QComboBox::down-arrow {"
+            " image:none;"
+            " width:0; height:0;"
+            " border-left:5px solid transparent;"
+            " border-right:5px solid transparent;"
+            " border-top:6px solid #ffb547;"
+            " margin-right:8px; }"
+            "QComboBox QAbstractItemView { min-height: 480px; }"
+        )
+        self._cat_combo.currentIndexChanged.connect(self._on_cat_changed)
+        cwl.addWidget(self._cat_combo)
         self._all_cats: list = []
+        ll.addWidget(cat_wrap)
+
+        self._count_lbl = QLabel("")
+        self._count_lbl.setObjectName("MutedSmall")
+        self._count_lbl.setFixedHeight(28)
+        self._count_lbl.setContentsMargins(14, 0, 14, 0)
+        ll.addWidget(self._count_lbl)
+
+        self._ch_list = ChannelListView()
+        self._ch_list.setObjectName("ChannelList")
+        self._ch_list.play_requested.connect(self._play)
+        self._ch_list.itemClicked.connect(self._on_ch_click)
+        self._ch_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._ch_list.customContextMenuRequested.connect(self._context_menu)
+        ll.addWidget(self._ch_list, stretch=1)
         root.addWidget(left)
 
-        # Right panel
+        # ── Right panel: player + EPG ─────────────────────────────────────────
         right = QWidget()
         rl = QVBoxLayout(right)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(0)
 
-        # Top bar
-        top = QWidget()
-        top.setFixedHeight(48)
-        top.setStyleSheet("background:#111;border-bottom:1px solid #222;")
-        tl = QHBoxLayout(top)
-        tl.setContentsMargins(12, 8, 12, 8)
-        self._search = QLineEdit()
-        self._search.setPlaceholderText("🔍  Search channels…")
-        self._search.textChanged.connect(self._filter)
-        tl.addWidget(self._search)
-        self._count_lbl = QLabel("")
-        self._count_lbl.setStyleSheet("color:#555;font-size:11px;margin-right:8px;")
-        tl.addWidget(self._count_lbl)
-        self._sync_btn = QPushButton("🔄  Sync")
-        self._sync_btn.setFixedWidth(80)
-        self._sync_btn.clicked.connect(self.sync)
-        tl.addWidget(self._sync_btn)
-        rl.addWidget(top)
+        # Player placeholder
+        player_frame = QFrame()
+        player_frame.setObjectName("PlayerHero")
+        player_frame.setMinimumHeight(300)
+        pfl = QVBoxLayout(player_frame)
+        pfl.setContentsMargins(0, 0, 0, 0)
+        pfl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # Channel list (fast delegate-based)
-        self._ch_list = ChannelListView()
-        self._ch_list.play_requested.connect(self._play)
-        self._ch_list.itemClicked.connect(self._on_ch_click)
-        self._ch_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._ch_list.customContextMenuRequested.connect(self._context_menu)
-        rl.addWidget(self._ch_list)
+        self._player_info = QLabel("Select a channel to watch")
+        self._player_info.setObjectName("PlayerInfo")
+        self._player_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pfl.addWidget(self._player_info)
+        rl.addWidget(player_frame, stretch=1)
 
         # EPG bar
-        epg = QWidget()
-        epg.setFixedHeight(44)
-        epg.setStyleSheet("background:#111;border-top:1px solid #222;")
+        epg = QFrame()
+        epg.setObjectName("EpgStrip")
+        epg.setFixedHeight(60)
         el = QHBoxLayout(epg)
-        el.setContentsMargins(12, 4, 12, 4)
-        self._epg_now  = QLabel("Select a channel")
-        self._epg_now.setObjectName("EpgCurrent")
+        el.setContentsMargins(20, 0, 20, 0)
+        el.setSpacing(16)
+
+        # Live dot with pulse
+        self._live_dot = QLabel("● LIVE")
+        self._live_dot.setObjectName("LivePill")
+        self._live_dot.hide()
+        self._live_pulse = LiveDotPulse(self._live_dot)
+        el.addWidget(self._live_dot)
+
+        now_col = QVBoxLayout()
+        now_col.setSpacing(2)
+        now_lbl = QLabel("NOW")
+        now_lbl.setObjectName("EpgHint")
+        self._epg_now = QLabel("Select a channel")
+        self._epg_now.setObjectName("EpgNow")
+        now_col.addWidget(now_lbl)
+        now_col.addWidget(self._epg_now)
+        el.addLayout(now_col, stretch=1)
+
+        sep = QFrame()
+        sep.setObjectName("VDiv")
+        sep.setFrameShape(QFrame.Shape.VLine)
+        el.addWidget(sep)
+
+        next_col = QVBoxLayout()
+        next_col.setSpacing(2)
+        next_lbl = QLabel("NEXT")
+        next_lbl.setObjectName("EpgHint")
         self._epg_next = QLabel("")
         self._epg_next.setObjectName("EpgNext")
-        el.addWidget(QLabel("NOW:"))
-        el.addWidget(self._epg_now, stretch=1)
-        el.addWidget(QLabel("NEXT:"))
-        el.addWidget(self._epg_next, stretch=1)
-        rl.addWidget(epg)
+        next_col.addWidget(next_lbl)
+        next_col.addWidget(self._epg_next)
+        el.addLayout(next_col, stretch=1)
 
+        rl.addWidget(epg)
         root.addWidget(right, stretch=1)
+
         self._loading = LoadingLabel(self)
 
     # ── Load from DB ──────────────────────────────────────────────────────────
 
     def _load_from_db(self):
-        cats = db.get_live_categories_cached()
+        w = ApiWorker(db.get_live_categories_cached)
+        w.result.connect(self._on_categories_loaded)
+        w.start()
+        self._w_cats = w
+
+    def _on_categories_loaded(self, cats):
         if cats:
             self._populate_categories(cats)
         else:
-            self._count_lbl.setText("No data — click Sync")
-            self.status_message.emit("No live TV data. Click 🔄 Sync.")
+            self._count_lbl.setText("No data — tap ↻ to sync")
+            self.status_message.emit("No live TV data. Click Sync.")
 
-    # ── Sync ─────────────────────────────────────────────────────────────────
+    # ── Sync ──────────────────────────────────────────────────────────────────
 
     def sync(self):
-        if self._syncing:
+        if self._syncing or self.api is None:
             return
         self._syncing = True
-        self._sync_btn.setText("Syncing…")
-        self._sync_btn.setEnabled(False)
         self.status_message.emit("Downloading M3U playlist…")
-
         self._w = ApiWorker(
             m3u.sync_all,
             self.api.server_url, self.api.username, self.api.password
@@ -143,19 +210,27 @@ class LiveTvWidget(QWidget):
 
     def _on_sync_done(self, stats: dict):
         self._syncing = False
-        self._sync_btn.setText("🔄  Sync")
-        self._sync_btn.setEnabled(True)
-        self._populate_categories(db.get_live_categories_cached())
+        cw = ApiWorker(db.get_live_categories_cached)
+        cw.result.connect(self._populate_categories)
+        cw.start()
+        self._w_cats_post_sync = cw
         self._load_channels_from_db(self._active_cat)
         n = stats.get('live', 0)
-        self.status_message.emit(f"Synced {n} channels — caching logos…")
+        added = stats.get('live_added', 0)
+        removed = stats.get('live_removed', 0)
+        self.status_message.emit(
+            f"Synced {n} channels — {added} new, {removed} removed — caching logos…"
+        )
         self._start_prefetch(stats.get('live_icons', []))
 
     def _on_sync_error(self, msg):
         self._syncing = False
-        self._sync_btn.setText("🔄  Sync")
-        self._sync_btn.setEnabled(True)
         self.status_message.emit(f"Sync error: {msg}")
+
+    def reload_after_sync(self):
+        if not self.api:
+            return
+        self._load_from_db()
 
     def _start_prefetch(self, urls):
         self._prefetcher = PosterPrefetcher(urls, parent=self)
@@ -169,67 +244,88 @@ class LiveTvWidget(QWidget):
 
     def _populate_categories(self, cats):
         self._all_cats = cats
-        self._render_categories(cats)
-
-    def _render_categories(self, cats):
-        current = self._cat_list.currentRow()
-        self._cat_list.blockSignals(True)
-        self._cat_list.clear()
-        all_item = QListWidgetItem("All Channels")
-        all_item.setData(Qt.ItemDataRole.UserRole, None)
-        self._cat_list.addItem(all_item)
+        self._cat_combo.blockSignals(True)
+        self._cat_combo.clear()
+        self._cat_combo.addItem("All categories", None)
         for cat in cats:
-            item = QListWidgetItem(cat.get('category_name', ''))
-            item.setData(Qt.ItemDataRole.UserRole, cat.get('category_id'))
-            self._cat_list.addItem(item)
-        self._cat_list.blockSignals(False)
-        self._cat_list.setCurrentRow(max(current, 0))
-        if current < 0:
-            self._on_cat_changed(0)
+            self._cat_combo.addItem(cat.get('category_name', ''), cat.get('category_id'))
+        self._cat_combo.blockSignals(False)
+        saved = db.get_setting('last_cat_live', '')
+        target = 0
+        if saved:
+            for i in range(self._cat_combo.count()):
+                if str(self._cat_combo.itemData(i) or '') == saved:
+                    target = i
+                    break
+        self._cat_combo.setCurrentIndex(target)
+        self._select_cat(self._cat_combo.itemData(target))
 
-    def _filter_categories(self, text: str):
-        if not text:
-            self._render_categories(self._all_cats)
-        else:
-            q = text.lower()
-            filtered = [c for c in self._all_cats
-                        if q in c.get('category_name', '').lower()]
-            self._render_categories(filtered)
+    def _on_cat_changed(self, idx):
+        cat_id = self._cat_combo.itemData(idx)
+        db.set_setting('last_cat_live', str(cat_id) if cat_id else '')
+        self._select_cat(cat_id)
 
-    def _on_cat_changed(self, row):
-        item = self._cat_list.item(row)
-        if item:
-            self._active_cat = item.data(Qt.ItemDataRole.UserRole)
-            self._load_channels_from_db(self._active_cat)
+    def _select_cat(self, cat_id):
+        self._active_cat = cat_id
+        self._load_channels_from_db(cat_id)
 
     # ── Channels ──────────────────────────────────────────────────────────────
 
     def _load_channels_from_db(self, category_id):
-        self._all_channels = db.get_live_streams_cached(category_id)
-        q = self._search.text().strip().lower()
-        channels = [c for c in self._all_channels if q in c.get('name','').lower()] if q else self._all_channels
-        self._ch_list.load(channels)
-        self._count_lbl.setText(f"{len(self._all_channels)} channels")
-        self.status_message.emit(f"{len(self._all_channels)} channels")
+        self._count_lbl.setText("Loading…")
+        w = ApiWorker(db.list_live_streams, category_id)
+        w.result.connect(self._on_channels_loaded)
+        w.error.connect(lambda e: self.status_message.emit(f"DB error: {e}"))
+        w.start()
+        self._w_load = w
 
-    def _filter(self, text):
-        q = text.strip()
-        if q:
-            filtered = db.search_live_streams(q)
-        else:
-            filtered = self._all_channels
-        self._ch_list.load(filtered)
-        self._count_lbl.setText(f"{len(filtered)} channels")
+    def _on_channels_loaded(self, channels):
+        self._all_channels = channels
+        q = self._search.text().strip().lower()
+        display = [c for c in channels if q in c.get('name', '').lower()] if q else channels
+        self._ch_list.load(display)
+        self._count_lbl.setText(f"{len(channels):,} channels")
+        self.status_message.emit(f"{len(channels)} channels")
+
+    def _filter(self, _text):
+        if not hasattr(self, '_search_timer'):
+            self._search_timer = QTimer(self)
+            self._search_timer.setSingleShot(True)
+            self._search_timer.setInterval(220)
+            self._search_timer.timeout.connect(self._do_search)
+        self._search_timer.start()
+
+    def _do_search(self):
+        q = self._search.text().strip()
+        if not q:
+            self._on_search_result(self._all_channels)
+            return
+        w = ApiWorker(db.search_live_streams_lite, q)
+        w.result.connect(self._on_search_result)
+        w.start()
+        self._w_search = w
+
+    def _on_search_result(self, rows):
+        self._ch_list.load(rows)
+        self._count_lbl.setText(f"{len(rows):,} channels")
 
     # ── Playback ──────────────────────────────────────────────────────────────
 
     def _play(self, ch: dict):
+        if not self.api:
+            return
         sid  = str(ch.get('stream_id', ''))
-        url  = self.api.live_url(sid, ch.get('container_extension', 'ts'))
+        ext  = ch.get('container_extension') or (db.get_live_stream_data(sid) or {}).get('container_extension', 'ts')
+        url  = self.api.live_url(sid, ext)
         name = ch.get('name', '')
         try:
             player.play(url, name)
             db.add_history(sid, 'live', name, ch.get('stream_icon', ''))
+            self._epg_now.setText(name)
+            self._live_dot.show()
+            self._live_pulse.start()
+            if hasattr(self, '_player_info'):
+                self._player_info.setText(f"Playing: {name}")
             self.status_message.emit(f"Playing: {name}")
         except FileNotFoundError as e:
             from PyQt6.QtWidgets import QMessageBox
@@ -237,7 +333,7 @@ class LiveTvWidget(QWidget):
 
     def _on_ch_click(self, list_item):
         ch = list_item.data(Qt.ItemDataRole.UserRole)
-        if not ch:
+        if not ch or not self.api:
             return
         self._epg_now.setText(ch.get('name', ''))
         self._epg_next.setText("")
@@ -266,10 +362,21 @@ class LiveTvWidget(QWidget):
         ch = item.data(Qt.ItemDataRole.UserRole)
         menu = QMenu(self)
         menu.addAction("▶  Play").triggered.connect(lambda: self._play(ch))
+        menu.addAction("📋  Copy URL").triggered.connect(lambda: self._copy_url(ch))
+        menu.addSeparator()
         sid = str(ch.get('stream_id',''))
-        lbl = "★  Remove Favorite" if db.is_favorite(sid,'live') else "☆  Add to Favorites"
+        lbl = "♥  Remove Favorite" if db.is_favorite(sid,'live') else "♡  Add to Favorites"
         menu.addAction(lbl).triggered.connect(lambda: self._toggle_fav(ch))
         menu.exec(self._ch_list.mapToGlobal(pos))
+
+    def _copy_url(self, ch: dict):
+        if not self.api:
+            return
+        sid = str(ch.get('stream_id', ''))
+        ext = ch.get('container_extension') or (db.get_live_stream_data(sid) or {}).get('container_extension', 'ts')
+        url = self.api.live_url(sid, ext)
+        QApplication.clipboard().setText(f"'{url}'")
+        self.status_message.emit(f"Copied URL for {ch.get('name', '')}")
 
     def _toggle_fav(self, ch):
         sid = str(ch.get('stream_id',''))
@@ -278,8 +385,7 @@ class LiveTvWidget(QWidget):
         else:
             db.add_favorite(sid,'live',ch.get('name',''),ch.get('stream_icon',''))
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._loading.resize(self.size())
+        if hasattr(self, '_loading'):
+            self._loading.resize(self.size())

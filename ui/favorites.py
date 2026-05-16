@@ -7,6 +7,7 @@ from PyQt6.QtGui import QAction
 
 import core.database as db
 import core.player as player
+from ui.workers import ApiWorker
 
 
 class FavoritesWidget(QWidget):
@@ -24,16 +25,17 @@ class FavoritesWidget(QWidget):
         layout.setSpacing(0)
 
         header = QWidget()
-        header.setFixedHeight(48)
-        header.setStyleSheet("background:#111; border-bottom:1px solid #222;")
+        header.setObjectName("PageHeader")
+        header.setFixedHeight(56)
         hl = QHBoxLayout(header)
-        hl.setContentsMargins(16, 8, 16, 8)
+        hl.setContentsMargins(24, 0, 24, 0)
         title = QLabel("Favorites & History")
-        title.setObjectName("SectionTitle")
+        title.setObjectName("FavHeading")
         hl.addWidget(title)
         layout.addWidget(header)
 
         self._tabs = QTabWidget()
+        self._tabs.setObjectName("SubTabs")
 
         self._fav_live = self._make_list('live')
         self._fav_vod = self._make_list('vod')
@@ -50,6 +52,7 @@ class FavoritesWidget(QWidget):
 
     def _make_list(self, stream_type, history=False) -> QListWidget:
         lst = QListWidget()
+        lst.setObjectName("PlainList")
         lst.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         lst.customContextMenuRequested.connect(
             lambda pos, l=lst, t=stream_type, h=history: self._context(pos, l, t, h)
@@ -68,13 +71,19 @@ class FavoritesWidget(QWidget):
     def _refresh(self, _=None):
         tab = self._tabs.currentIndex()
         if tab == 0:
-            self._populate(self._fav_live, db.get_favorites('live'))
+            self._dispatch(self._fav_live, db.get_favorites, 'live')
         elif tab == 1:
-            self._populate(self._fav_vod, db.get_favorites('vod'))
+            self._dispatch(self._fav_vod, db.get_favorites, 'vod')
         elif tab == 2:
-            self._populate(self._fav_series, db.get_favorites('series'))
+            self._dispatch(self._fav_series, db.get_favorites, 'series')
         elif tab == 3:
-            self._populate(self._history_list, db.get_history(100))
+            self._dispatch(self._history_list, db.get_history, 100)
+
+    def _dispatch(self, lst, fn, *args):
+        w = ApiWorker(fn, *args)
+        w.result.connect(lambda rows, l=lst: self._populate(l, rows))
+        w.start()
+        self._w = w
 
     def _populate(self, lst: QListWidget, rows: list):
         lst.clear()

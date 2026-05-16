@@ -15,16 +15,26 @@ class LoginDialog(QDialog):
         self.server_id = None
 
         self.setWindowTitle("Add Server" if server is None else "Edit Server")
-        self.setFixedSize(440, 320)
+        self.setFixedSize(480, 360)
         self.setModal(True)
+        self.setStyleSheet("""
+            QDialog { background: #121216; border: 1px solid #232329; border-radius: 14px; }
+            QLabel { color: #f1efe9; }
+            QLineEdit { background: #18181d; border: 1px solid #232329; border-radius: 10px;
+                padding: 9px 14px; color: #f1efe9; font-size: 13px; }
+            QLineEdit:focus { border-color: #ffb547; }
+            QLineEdit::placeholder { color: #6b6960; }
+        """)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(16)
-        layout.setContentsMargins(28, 28, 28, 28)
+        layout.setContentsMargins(32, 32, 32, 32)
 
         title = QLabel("Add Server" if server is None else "Edit Server")
-        title.setStyleSheet("font-size: 20px; font-weight: 700; color: #c4bbfc; letter-spacing: -0.3px;")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet(
+            'font-family: "Instrument Serif", Georgia, serif; '
+            'font-size: 26px; color: #f1efe9; font-weight: 400;'
+        )
         layout.addWidget(title)
 
         form = QFormLayout()
@@ -61,6 +71,22 @@ class LoginDialog(QDialog):
         btns.addWidget(self._btn_save)
         layout.addLayout(btns)
 
+        self._btn_cancel.setStyleSheet("""
+            QPushButton { background: rgba(255,255,255,0.06); border: 1px solid #2e2e36;
+                color: #a8a59c; border-radius: 10px; padding: 10px 18px; font-size: 13px; }
+            QPushButton:hover { border-color: #ff6b6b; color: #ff6b6b; }
+        """)
+        self._btn_test.setStyleSheet("""
+            QPushButton { background: rgba(255,255,255,0.06); border: 1px solid #2e2e36;
+                color: #a8a59c; border-radius: 10px; padding: 10px 18px; font-size: 13px; }
+            QPushButton:hover { border-color: #ffb547; color: #ffb547; }
+        """)
+        self._btn_save.setStyleSheet("""
+            QPushButton { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #ffb547,stop:1 #ff7a1a);
+                color: #1a1004; border: none; border-radius: 10px;
+                padding: 10px 22px; font-size: 13px; font-weight: 600; }
+            QPushButton:hover { background: #ffc060; }
+        """)
         self._btn_cancel.clicked.connect(self.reject)
         self._btn_test.clicked.connect(self._test)
         self._btn_save.clicked.connect(self._save)

@@ -162,15 +162,19 @@ info "Detecting Python environment..."
 
 if [ -f ".venv/bin/python" ]; then
     PYTHON=".venv/bin/python"
-    PYINSTALLER=".venv/bin/pyinstaller"
+    PYINSTALLER=(".venv/bin/pyinstaller")
     info "Using venv: .venv"
 elif [ -f "venv/bin/python" ]; then
     PYTHON="venv/bin/python"
-    PYINSTALLER="venv/bin/pyinstaller"
+    PYINSTALLER=("venv/bin/pyinstaller")
     info "Using venv: venv"
+elif [ -f "$HOME/myenv/bin/python3" ]; then
+    PYTHON="$HOME/myenv/bin/python3"
+    PYINSTALLER=("$HOME/myenv/bin/pyinstaller")
+    info "Using venv: ~/myenv"
 else
     PYTHON=$(which python3 2>/dev/null || which python 2>/dev/null)
-    PYINSTALLER=$(which pyinstaller 2>/dev/null || echo "")
+    PYINSTALLER=($(which pyinstaller 2>/dev/null || echo ""))
     if [ -z "$PYTHON" ]; then
         error "No Python found. Install Python 3 or create a venv."
     fi
@@ -183,14 +187,18 @@ success "Found: $PYTHON_VERSION"
 # ------------------------------------------------------------------------------
 # 2. Check PyInstaller
 # ------------------------------------------------------------------------------
-if [ -z "$PYINSTALLER" ] || [ ! -f "$PYINSTALLER" ]; then
-    PYINSTALLER=$("$PYTHON" -m PyInstaller --version &>/dev/null && echo "$PYTHON -m PyInstaller" || echo "")
+if [ "${#PYINSTALLER[@]}" -eq 0 ] || [ -z "${PYINSTALLER[0]}" ] || [ ! -f "${PYINSTALLER[0]}" ]; then
+    if "$PYTHON" -m PyInstaller --version &>/dev/null; then
+        PYINSTALLER=("$PYTHON" "-m" "PyInstaller")
+    else
+        PYINSTALLER=()
+    fi
 fi
 
-if [ -z "$PYINSTALLER" ]; then
+if [ "${#PYINSTALLER[@]}" -eq 0 ]; then
     warn "PyInstaller not found. Installing..."
     "$PYTHON" -m pip install pyinstaller --break-system-packages
-    PYINSTALLER="$PYTHON -m PyInstaller"
+    PYINSTALLER=("$PYTHON" "-m" "PyInstaller")
 fi
 
 success "PyInstaller ready"
@@ -212,12 +220,16 @@ success "Cleaned"
 # ------------------------------------------------------------------------------
 info "Building binary (this may take a minute)..."
 
-$PYINSTALLER \
+"${PYINSTALLER[@]}" \
     --onefile \
     --name "$APP_NAME" \
     --noconfirm \
     --clean \
     --icon "iptvshow.ico" \
+    \
+    `# --- bundled assets ---` \
+    --add-data "assets/fonts:assets/fonts" \
+    --add-data "assets/icons:assets/icons" \
     \
     `# --- PyQt6 core ---` \
     --hidden-import PyQt6 \

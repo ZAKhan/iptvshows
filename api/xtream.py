@@ -10,6 +10,10 @@ class XtreamAPI:
         self.base_url = f"{self.server_url}/player_api.php"
         self.session = requests.Session()
         self.session.timeout = 20
+        self.session.headers.update({
+            'User-Agent': 'VLC/3.0.20 LibVLC/3.0.20',
+            'Accept': '*/*',
+        })
         self.user_info: Dict = {}
         self.server_info: Dict = {}
 
@@ -18,6 +22,12 @@ class XtreamAPI:
             self.base_url,
             params={'username': self.username, 'password': self.password}
         )
+        if resp.status_code == 461:
+            raise ValueError(
+                "Server blocked the request (HTTP 461). "
+                "The panel rejected this client's User-Agent or IP. "
+                "Try a VPN or contact your provider."
+            )
         resp.raise_for_status()
         data = resp.json()
         self.user_info = data.get('user_info', {})

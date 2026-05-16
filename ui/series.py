@@ -1,13 +1,15 @@
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QApplication,
     QListWidgetItem, QLineEdit, QPushButton, QTextEdit,
     QStackedWidget, QSplitter, QMessageBox, QScrollArea, QMenu,
+    QFrame,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QEvent
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 
-from ui.workers import ApiWorker, ImageWorker, PosterPrefetcher
-from ui.widgets import MediaListView, LoadingLabel, _placeholder
+from ui.workers import ApiWorker, ImageWorker, PosterPrefetcher, TMDBFetcher
+from ui.widgets import MediaListView, LoadingLabel, _placeholder, SearchField
+from ui.anim import apply_card_shadow
 import core.database as db
 import core.player as player
 import api.m3u as m3u
@@ -23,38 +25,43 @@ class SeriesWidget(QWidget):
         self._all_series: list = []
         self._seasons_data: dict = {}
         self._syncing = False
+        self._tmdb_worker = None
+        self._view_mode = 'all'   # 'all' | 'new'
 
         self._build_ui()
-        self._initial_load()   # DB only — no network
-
-    # ── Layout ────────────────────────────────────────────────────────────────
+        self._initial_load()
 
     def _build_ui(self):
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Category sidebar
-        left = QWidget()
-        left.setFixedWidth(200)
+        if self.api is None:
+            empty = QLabel("No server connected")
+            empty.setObjectName("PlayerInfo")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            root.addWidget(empty)
+            return
+
+        # ── Category sidebar ──────────────────────────────────────────────────
+        left = QFrame()
+        left.setObjectName("SidebarPanel")
+        left.setFixedWidth(220)
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.setSpacing(0)
-        hdr = QLabel("  Categories")
-        hdr.setFixedHeight(26)
-        hdr.setStyleSheet(
-            "background:#111;color:#666;font-size:10px;"
-            "text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid #222;"
-        )
-        ll.addWidget(hdr)
 
-        self._cat_search = QLineEdit()
-        self._cat_search.setPlaceholderText("Filter…")
-        self._cat_search.setFixedHeight(24)
-        self._cat_search.setStyleSheet(
-            "background:#1a1a1a;border:none;border-bottom:1px solid #222;"
-            "color:#ccc;padding:0 8px;font-size:11px;"
-        )
+        cat_hdr = QWidget()
+        cat_hdr.setObjectName("PageHeader")
+        cat_hdr.setFixedHeight(48)
+        chl = QHBoxLayout(cat_hdr)
+        chl.setContentsMargins(14, 0, 14, 0)
+        lbl = QLabel("CATEGORIES")
+        lbl.setObjectName("SectionLbl")
+        chl.addWidget(lbl)
+        ll.addWidget(cat_hdr)
+
+        self._cat_search = SearchField("Filter categories…")
         self._cat_search.textChanged.connect(self._filter_categories)
         ll.addWidget(self._cat_search)
 
@@ -62,45 +69,65 @@ class SeriesWidget(QWidget):
         self._cat_list.setObjectName("CategoryList")
         self._cat_list.currentRowChanged.connect(self._on_cat_changed)
         ll.addWidget(self._cat_list)
-        self._all_cats: list = []   # full unfiltered list
+        self._all_cats: list = []
         root.addWidget(left)
 
-        # Right stacked: grid ↔ detail
+        # ── Right stack (grid ↔ detail) ───────────────────────────────────────
         self._stack = QStackedWidget()
-        self._stack.addWidget(self._build_grid_page())    # 0
-        self._stack.addWidget(self._build_detail_page())  # 1
+        self._stack.addWidget(self._build_grid_page())
+        self._stack.addWidget(self._build_detail_page())
         root.addWidget(self._stack, stretch=1)
 
         self._loading = LoadingLabel(self)
 
     def _build_grid_page(self) -> QWidget:
         page = QWidget()
-        rl = QVBoxLayout(page)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.setSpacing(0)
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
 
         top = QWidget()
-        top.setFixedHeight(34)
-        top.setStyleSheet("background:#111;border-bottom:1px solid #222;")
+        top.setObjectName("TabHeader")
+        top.setFixedHeight(56)
         tl = QHBoxLayout(top)
-        tl.setContentsMargins(8, 4, 8, 4)
-        self._search = QLineEdit()
-        self._search.setPlaceholderText("🔍  Search series…")
-        self._search.textChanged.connect(self._filter)
-        tl.addWidget(self._search)
-        self._count_lbl = QLabel("")   # fix 1: was missing
-        self._count_lbl.setStyleSheet("color:#555;font-size:11px;margin-right:8px;")
+        tl.setContentsMargins(20, 8, 20, 8)
+        tl.setSpacing(12)
+
+        title_lbl = QLabel("Series")
+        title_lbl.setObjectName("TabHeading")
+        tl.addWidget(title_lbl)
+
+        self._count_lbl = QLabel("")
+        self._count_lbl.setObjectName("CountLbl")
         tl.addWidget(self._count_lbl)
-        self._sync_btn = QPushButton("🔄  Sync")
-        self._sync_btn.setFixedWidth(80)
-        self._sync_btn.clicked.connect(self.sync)
-        tl.addWidget(self._sync_btn)
-        rl.addWidget(top)
+
+        tl.addSpacing(16)
+        self._seg_all = QPushButton("All")
+        self._seg_all.setObjectName("Chip")
+        self._seg_all.setProperty("active", "true")
+        self._seg_all.setFixedHeight(28)
+        self._seg_all.clicked.connect(lambda: self._set_view('all'))
+        tl.addWidget(self._seg_all)
+        self._seg_new = QPushButton("New")
+        self._seg_new.setObjectName("Chip")
+        self._seg_new.setFixedHeight(28)
+        self._seg_new.clicked.connect(lambda: self._set_view('new'))
+        tl.addWidget(self._seg_new)
+
+        tl.addStretch()
+
+        self._search = SearchField("Search series…")
+        self._search.setMinimumWidth(160)
+        self._search.setMaximumWidth(260)
+        self._search.textChanged.connect(self._filter)
+        tl.addWidget(self._search, stretch=1)
+
+        v.addWidget(top)
 
         self._grid = MediaListView()
         self._grid.card_clicked.connect(self._show_detail)
         self._grid.card_play.connect(self._show_detail)
-        rl.addWidget(self._grid)
+        v.addWidget(self._grid)
         return page
 
     def _build_detail_page(self) -> QWidget:
@@ -111,131 +138,120 @@ class SeriesWidget(QWidget):
 
         # Top bar
         bar = QWidget()
-        bar.setFixedHeight(34)
-        bar.setStyleSheet("background:#111;border-bottom:1px solid #1e1e2e;")
+        bar.setObjectName("TabHeader")
+        bar.setFixedHeight(52)
         bl = QHBoxLayout(bar)
-        bl.setContentsMargins(8, 4, 8, 4)
+        bl.setContentsMargins(20, 8, 20, 8)
         back_btn = QPushButton("← Back")
-        back_btn.setFixedWidth(80)
+        back_btn.setObjectName("BackBtn")
         back_btn.clicked.connect(lambda: self._stack.setCurrentIndex(0))
-        bl.addWidget(back_btn)
-
         esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), page)
         esc.activated.connect(lambda: self._stack.setCurrentIndex(0))
         self._d_title_bar = QLabel()
-        self._d_title_bar.setStyleSheet("font-size:13px;font-weight:600;color:#c4bbfc;padding-left:10px;")
-        self._d_title_bar.setMaximumWidth(800)
+        self._d_title_bar.setObjectName("DetailBarTitle")
+        bl.addWidget(back_btn)
         bl.addWidget(self._d_title_bar, stretch=1)
         root.addWidget(bar)
 
-        # Info strip: poster + rich metadata
-        info_strip = QWidget()
-        info_strip.setFixedHeight(190)
-        info_strip.setStyleSheet("background:#0f0f1c;border-bottom:1px solid #1e1e2e;")
+        # Hero info strip
+        info_strip = QFrame()
+        info_strip.setObjectName("DetailInfoStrip")
+        info_strip.setFixedHeight(200)
         isl = QHBoxLayout(info_strip)
-        isl.setContentsMargins(14, 10, 14, 10)
-        isl.setSpacing(14)
+        isl.setContentsMargins(24, 16, 24, 16)
+        isl.setSpacing(20)
 
         self._d_poster = QLabel()
         self._d_poster.setFixedSize(113, 170)
         self._d_poster.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._d_poster.setPixmap(_placeholder(113, 170, "🎞"))
-        self._d_poster.setStyleSheet("border-radius:6px;")
+        self._d_poster.setStyleSheet("border-radius: 10px;")
+        apply_card_shadow(self._d_poster)
         isl.addWidget(self._d_poster)
 
         meta_col = QVBoxLayout()
-        meta_col.setSpacing(3)
-        meta_col.setContentsMargins(0, 0, 0, 0)
+        meta_col.setSpacing(4)
 
         self._d_title = QLabel()
-        self._d_title.setStyleSheet("font-size:16px;font-weight:700;color:#eeeef8;")
+        self._d_title.setObjectName("PanelHeading")
         meta_col.addWidget(self._d_title)
 
-        # Row: year · TMDB score · seasons · episodes
         self._d_meta = QLabel()
-        self._d_meta.setStyleSheet("color:#6a6a8a;font-size:11px;")
+        self._d_meta.setObjectName("CountLbl")
         meta_col.addWidget(self._d_meta)
 
-        # Genres
         self._d_genres = QLabel()
-        self._d_genres.setObjectName("GenresLabel")
+        self._d_genres.setObjectName("MutedDesc")
         meta_col.addWidget(self._d_genres)
 
-        # Network · Status · Created by
         self._d_network = QLabel()
-        self._d_network.setObjectName("NetworkLabel")
+        self._d_network.setObjectName("NetworkLbl")
         meta_col.addWidget(self._d_network)
 
-        # Description
         self._d_desc = QLabel()
         self._d_desc.setWordWrap(True)
-        self._d_desc.setStyleSheet("color:#8888aa;font-size:11px;line-height:1.4;")
-        self._d_desc.setMaximumHeight(64)
+        self._d_desc.setObjectName("MutedDesc")
+        self._d_desc.setMaximumHeight(60)
         self._d_desc.setAlignment(Qt.AlignmentFlag.AlignTop)
         meta_col.addWidget(self._d_desc)
-
         meta_col.addStretch()
         isl.addLayout(meta_col, stretch=1)
         root.addWidget(info_strip)
 
-        # Button bar
+        # Action bar
         btn_bar = QWidget()
-        btn_bar.setFixedHeight(32)
-        btn_bar.setStyleSheet("background:#0a0a12;border-bottom:1px solid #1e1e2e;")
+        btn_bar.setObjectName("TabHeader")
+        btn_bar.setFixedHeight(52)
         bbl = QHBoxLayout(btn_bar)
-        bbl.setContentsMargins(10, 4, 10, 4)
-        bbl.setSpacing(6)
+        bbl.setContentsMargins(20, 8, 20, 8)
+        bbl.setSpacing(10)
 
         self._d_continue_btn = QPushButton("▶  Continue")
-        self._d_continue_btn.setObjectName("PlayBtn")
+        self._d_continue_btn.setObjectName("PrimaryGradBtn")
+        self._d_continue_btn.setFixedHeight(36)
         self._d_continue_btn.setVisible(False)
         bbl.addWidget(self._d_continue_btn)
 
-        self._d_fav_btn = QPushButton("☆  Favorite")
+        self._d_fav_btn = QPushButton("♡  Favorite")
         self._d_fav_btn.setObjectName("FavBtn")
+        self._d_fav_btn.setFixedHeight(36)
         bbl.addWidget(self._d_fav_btn)
-
         bbl.addStretch()
         root.addWidget(btn_bar)
 
-        # Seasons | Episodes splitter
+        # Season | Episode splitter
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(1)
 
         self._season_list = QListWidget()
-        self._season_list.setObjectName("CategoryList")
-        self._season_list.setMaximumWidth(160)
+        self._season_list.setObjectName("SeasonList")
+        self._season_list.setMaximumWidth(180)
         self._season_list.currentRowChanged.connect(self._on_season_changed)
         splitter.addWidget(self._season_list)
 
         self._ep_list = QListWidget()
+        self._ep_list.setObjectName("EpisodeList")
         self._ep_list.itemDoubleClicked.connect(self._play_episode)
         self._ep_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._ep_list.customContextMenuRequested.connect(self._ep_context_menu)
         splitter.addWidget(self._ep_list)
-        splitter.setSizes([160, 9999])
-
+        splitter.setSizes([180, 9999])
         root.addWidget(splitter, stretch=1)
 
-        # Status bar at bottom
         self._ep_status = QLabel("Double-click an episode to play")
-        self._ep_status.setStyleSheet("color:#444460;font-size:10px;padding:2px 10px;"
-                                      "background:#0a0a12;border-top:1px solid #1e1e2e;")
-        self._ep_status.setFixedHeight(20)
+        self._ep_status.setObjectName("EpStatus")
+        self._ep_status.setFixedHeight(24)
         root.addWidget(self._ep_status)
 
         return page
 
-    # ── Sync (user-triggered only) ────────────────────────────────────────────
+    # ── Sync ──────────────────────────────────────────────────────────────────
 
     def sync(self):
-        if self._syncing:
+        if self._syncing or self.api is None:
             return
         self._syncing = True
-        self._sync_btn.setText("Syncing…")
-        self._sync_btn.setEnabled(False)
         self.status_message.emit("Downloading M3U playlist…")
-
         self._w = ApiWorker(
             m3u.sync_all,
             self.api.server_url, self.api.username, self.api.password
@@ -246,12 +262,14 @@ class SeriesWidget(QWidget):
 
     def _on_sync_done(self, stats: dict):
         self._syncing = False
-        self._sync_btn.setText("🔄  Sync")
-        self._sync_btn.setEnabled(True)
         self._populate_categories(db.get_series_categories_cached())
         self._load_from_db(self._active_cat_id())
         n = stats.get('series', 0)
-        self.status_message.emit(f"Synced {n} series — fetching posters…")
+        added = stats.get('series_added', 0)
+        removed = stats.get('series_removed', 0)
+        self.status_message.emit(
+            f"Synced {n} series — {added} new, {removed} removed"
+        )
         self._start_prefetch(stats.get('series_icons', []))
 
     def _start_prefetch(self, urls: list):
@@ -259,21 +277,29 @@ class SeriesWidget(QWidget):
         self._prefetcher.progress.connect(
             lambda done, total: self.status_message.emit(f"Caching posters: {done}/{total}…")
         )
-        self._prefetcher.finished.connect(
-            lambda: self.status_message.emit("All posters cached.")
-        )
+        self._prefetcher.finished.connect(lambda: self.status_message.emit("All posters cached."))
         self._prefetcher.start()
 
     def _on_sync_error(self, msg):
         self._syncing = False
-        self._sync_btn.setText("🔄  Sync")
-        self._sync_btn.setEnabled(True)
         self.status_message.emit(f"Sync error: {msg}")
+
+    def reload_after_sync(self):
+        if not self.api:
+            return
+        self._initial_load()
 
     # ── Categories ────────────────────────────────────────────────────────────
 
     def _initial_load(self):
-        cats = db.get_series_categories_cached()
+        if self.api is None:
+            return
+        w = ApiWorker(db.get_series_categories_cached)
+        w.result.connect(self._on_categories_loaded)
+        w.start()
+        self._w_cats = w
+
+    def _on_categories_loaded(self, cats):
         if cats:
             self._populate_categories(cats)
         else:
@@ -295,23 +321,35 @@ class SeriesWidget(QWidget):
             item.setData(Qt.ItemDataRole.UserRole, cat.get('category_id'))
             self._cat_list.addItem(item)
         self._cat_list.blockSignals(False)
-        self._cat_list.setCurrentRow(max(current, 0))
         if current < 0:
-            self._load_from_db(None)
+            saved = db.get_setting('last_cat_series', '')
+            target = 0
+            if saved:
+                for i in range(self._cat_list.count()):
+                    if str(self._cat_list.item(i).data(Qt.ItemDataRole.UserRole) or '') == saved:
+                        target = i
+                        break
+            self._cat_list.setCurrentRow(target)
+            if target == 0:
+                self._load_from_db(None)
+        else:
+            self._cat_list.setCurrentRow(current)
 
     def _filter_categories(self, text: str):
         if not text:
             self._render_categories(self._all_cats)
         else:
             q = text.lower()
-            filtered = [c for c in self._all_cats
-                        if q in c.get('category_name', '').lower()]
-            self._render_categories(filtered)
+            self._render_categories(
+                [c for c in self._all_cats if q in c.get('category_name', '').lower()]
+            )
 
     def _on_cat_changed(self, row):
         item = self._cat_list.item(row)
         if item:
-            self._load_from_db(item.data(Qt.ItemDataRole.UserRole))
+            cid = item.data(Qt.ItemDataRole.UserRole)
+            db.set_setting('last_cat_series', str(cid) if cid else '')
+            self._load_from_db(cid)
             self._stack.setCurrentIndex(0)
 
     def _active_cat_id(self):
@@ -321,24 +359,84 @@ class SeriesWidget(QWidget):
     # ── Grid ──────────────────────────────────────────────────────────────────
 
     def _load_from_db(self, cat_id):
-        series = db.get_series_cached(cat_id)
+        self._count_lbl.setText("Loading…")
+        if self._view_mode == 'new':
+            w = ApiWorker(db.list_new_series, '')
+        else:
+            w = ApiWorker(db.list_series, cat_id)
+        w.result.connect(self._on_series_loaded)
+        w.error.connect(lambda e: self.status_message.emit(f"DB error: {e}"))
+        w.start()
+        self._w_load = w
+
+    def _set_view(self, mode: str):
+        if mode == self._view_mode:
+            return
+        self._view_mode = mode
+        for btn, m in ((self._seg_all, 'all'), (self._seg_new, 'new')):
+            btn.setProperty('active', 'true' if m == mode else 'false')
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        q = self._search.text().strip()
+        if q:
+            self._do_search()
+        else:
+            self._load_from_db(self._active_cat_id())
+
+    def _on_series_loaded(self, series):
         self._all_series = series
         self._show_loading(False)
         q = self._search.text().strip().lower()
-        display = [s for s in series if q in s.get('name','').lower()] if q else series
+        display = [s for s in series if q in s.get('name', '').lower()] if q else series
         self._attach_statuses(display)
         self._grid.load(display)
-        self._count_lbl.setText(f"{len(self._all_series)} series")
+        self._count_lbl.setText(f"{len(self._all_series):,} series")
+        # TMDB poster fetching is triggered from Settings → Playback.
 
-    def _filter(self, text):
-        q = text.strip()
-        if q:
-            filtered = db.search_series(q)
+    def _start_tmdb_fetch(self):
+        key = db.get_setting('tmdb_api_key', '')
+        if not key or self._tmdb_worker is not None:
+            return
+        self._tmdb_worker = TMDBFetcher(key, mode='tv', parent=self)
+        self._tmdb_worker.poster_updated.connect(self._on_tmdb_poster)
+        self._tmdb_worker.finished.connect(self._on_tmdb_done)
+        self._tmdb_worker.progress.connect(
+            lambda d, t: self.status_message.emit(f"TMDB posters: {d}/{t}…")
+        )
+        self._tmdb_worker.start()
+
+    def _on_tmdb_poster(self, _kind: str, series_id: str, url: str):
+        self._grid.refresh_poster(series_id, url)
+
+    def _on_tmdb_done(self):
+        self._tmdb_worker = None
+        self.status_message.emit("TMDB poster fetch complete.")
+
+    def _filter(self, _text):
+        if not hasattr(self, '_search_timer'):
+            self._search_timer = QTimer(self)
+            self._search_timer.setSingleShot(True)
+            self._search_timer.setInterval(220)
+            self._search_timer.timeout.connect(self._do_search)
+        self._search_timer.start()
+
+    def _do_search(self):
+        q = self._search.text().strip()
+        if not q:
+            self._on_search_result(self._all_series)
+            return
+        if self._view_mode == 'new':
+            w = ApiWorker(db.list_new_series, q)
         else:
-            filtered = self._all_series
-        self._attach_statuses(filtered)
-        self._grid.load(filtered)
-        self._count_lbl.setText(f"{len(filtered)} series")
+            w = ApiWorker(db.search_series_lite, q)
+        w.result.connect(self._on_search_result)
+        w.start()
+        self._w_search = w
+
+    def _on_search_result(self, rows):
+        self._attach_statuses(rows)
+        self._grid.load(rows)
+        self._count_lbl.setText(f"{len(rows):,} series")
 
     def _attach_statuses(self, items: list):
         ids = [str(s.get('series_id', '')) for s in items]
@@ -349,20 +447,23 @@ class SeriesWidget(QWidget):
     # ── Detail panel ──────────────────────────────────────────────────────────
 
     def _show_detail(self, item: dict):
-        self._current_series = item
         sid = str(item.get('series_id', ''))
-
+        full = db.get_series_data(sid)
+        if full:
+            full['_watch_status'] = item.get('_watch_status')
+            item = full
+        self._current_series = item
         name = item.get('name', '')
+
         self._d_title_bar.setText(name)
         self._d_title.setText(name)
 
-        # Build meta line from available IPTV data
         r = item.get('rating') or item.get('rating_5based', '')
         parts = []
         if item.get('releaseDate'):
             parts.append(str(item['releaseDate'])[:4])
         if r:
-            parts.append(f"⭐ {r}")
+            parts.append(f"★ {r}")
         self._d_meta.setText("  ·  ".join(parts))
         self._d_genres.setText("")
         self._d_network.setText("")
@@ -374,24 +475,20 @@ class SeriesWidget(QWidget):
         self._seasons_data = {}
 
         self._update_fav_btn(sid)
-        try:
-            self._d_fav_btn.clicked.disconnect()
-        except TypeError:
-            pass
+        try: self._d_fav_btn.clicked.disconnect()
+        except TypeError: pass
         self._d_fav_btn.clicked.connect(lambda: self._toggle_fav(item))
 
-        # Continue button
-        try:
-            self._d_continue_btn.clicked.disconnect()
-        except TypeError:
-            pass
+        try: self._d_continue_btn.clicked.disconnect()
+        except TypeError: pass
         progress = db.get_series_progress(sid)
         if progress:
             label = f"▶  Continue: S{progress['season_num']} · E{progress['ep_num']} — {progress['ep_title']}"
             self._d_continue_btn.setText(label)
             self._d_continue_btn.setVisible(True)
-            self._d_continue_btn.clicked.connect(lambda: self._jump_to_episode(
-                progress['season_num'], progress['episode_id'], play=True))
+            self._d_continue_btn.clicked.connect(
+                lambda: self._jump_to_episode(progress['season_num'], progress['episode_id'], play=True)
+            )
         else:
             self._d_continue_btn.setVisible(False)
 
@@ -404,7 +501,6 @@ class SeriesWidget(QWidget):
             w.start()
             self._pw = w
 
-        # Fetch rich TMDB metadata in background
         api_key = db.get_setting('tmdb_api_key', '')
         if api_key and name:
             tw = ApiWorker(tmdb.get_tv_details, api_key, name)
@@ -414,10 +510,9 @@ class SeriesWidget(QWidget):
 
         m3u_eps = item.get('_m3u_episodes')
         if m3u_eps:
-            # Episode data already embedded from M3U parse — no API call needed
             self._on_series_info({'info': {}, 'seasons': m3u_eps['seasons'],
                                   'episodes': m3u_eps['episodes']})
-        else:
+        elif self.api:
             w2 = ApiWorker(self.api.get_series_info, sid)
             w2.result.connect(self._on_series_info)
             w2.error.connect(lambda e: self._ep_status.setText(f"Error: {e}"))
@@ -459,7 +554,6 @@ class SeriesWidget(QWidget):
             f"{self._season_list.count()} seasons · {total} episodes  —  double-click to play"
         )
 
-        # Jump to last played episode if progress exists, otherwise go to S1
         sid = str(self._current_series.get('series_id', ''))
         progress = db.get_series_progress(sid)
         if progress and self._season_list.count():
@@ -470,44 +564,29 @@ class SeriesWidget(QWidget):
     def _on_tmdb_details(self, data: dict):
         if not data:
             return
-
-        # Update meta line with TMDB score + season/episode counts
         parts = []
-        if data.get('year'):
-            parts.append(data['year'])
-        if data.get('vote_average'):
-            parts.append(f"TMDB ⭐ {data['vote_average']}")
-        if data.get('number_of_seasons'):
-            parts.append(f"{data['number_of_seasons']} seasons")
-        if data.get('number_of_episodes'):
-            parts.append(f"{data['number_of_episodes']} eps")
+        if data.get('year'):             parts.append(data['year'])
+        if data.get('vote_average'):     parts.append(f"TMDB ★ {data['vote_average']}")
+        if data.get('number_of_seasons'): parts.append(f"{data['number_of_seasons']} seasons")
+        if data.get('number_of_episodes'): parts.append(f"{data['number_of_episodes']} eps")
         if parts:
             self._d_meta.setText("  ·  ".join(parts))
 
-        # Genres
         genres = data.get('genres', [])
         if genres:
             self._d_genres.setText("  ·  ".join(genres[:4]))
 
-        # Network · Status · Created by
         network_parts = []
-        networks = data.get('networks', [])
-        if networks:
-            network_parts.append(networks[0])
-        if data.get('status'):
-            network_parts.append(data['status'])
-        creators = data.get('created_by', [])
-        if creators:
-            network_parts.append("by " + ", ".join(creators[:2]))
+        if data.get('networks'):         network_parts.append(data['networks'][0])
+        if data.get('status'):           network_parts.append(data['status'])
+        if data.get('created_by'):       network_parts.append("by " + ", ".join(data['created_by'][:2]))
         if network_parts:
             self._d_network.setText("  ·  ".join(network_parts))
 
-        # Override description with TMDB overview if it has meaningful content
         overview = data.get('overview', '')
         if overview and len(overview) > len(self._d_desc.text()):
             self._d_desc.setText(overview)
 
-        # Use TMDB poster if available and no cover already loaded
         poster_url = data.get('poster_url')
         if poster_url:
             w = ImageWorker(poster_url, size=(113, 170))
@@ -532,7 +611,8 @@ class SeriesWidget(QWidget):
             ep_title = ep.get('title', f"Episode {ep_num}")
             status   = ep_statuses.get(ep_id)
             prefix   = "✓  " if status == 'watched' else ("…  " if status == 'in_progress' else "    ")
-            label    = f"{prefix}{ep_num:>3}.  {ep_title}" if isinstance(ep_num, int) else f"{prefix}{ep_title}"
+            label    = (f"{prefix}{ep_num:>3}.  {ep_title}"
+                       if isinstance(ep_num, int) else f"{prefix}{ep_title}")
             litem = QListWidgetItem(label)
             litem.setData(Qt.ItemDataRole.UserRole,     ep)
             litem.setData(Qt.ItemDataRole.UserRole + 1, status)
@@ -540,7 +620,7 @@ class SeriesWidget(QWidget):
 
     def _play_episode(self, list_item):
         ep = list_item.data(Qt.ItemDataRole.UserRole)
-        if not ep:
+        if not ep or not self.api:
             return
         ep_id    = str(ep.get('id', ''))
         ep_num   = ep.get('episode_num', '?')
@@ -550,7 +630,6 @@ class SeriesWidget(QWidget):
         series_name = self._current_series.get('name', '')
         title    = f"{series_name} — {ep_title}"
 
-        # Current season from the season selector
         season_item = self._season_list.currentItem()
         season_num  = season_item.data(Qt.ItemDataRole.UserRole) if season_item else '1'
 
@@ -558,39 +637,27 @@ class SeriesWidget(QWidget):
             player.play(url, title)
             series_id = str(self._current_series.get('series_id', ''))
             db.add_history(ep_id, 'series', title, self._current_series.get('cover', ''))
-
-            # Save last-played position for this series
             db.save_series_progress(series_id, ep_id, season_num, ep_num, ep_title)
 
-            # Mark episode and series-level status
             if db.get_watch_status(ep_id, 'series_ep') != 'watched':
                 self._set_ep_status(ep_id, 'in_progress', list_item)
             if db.get_watch_status(series_id, 'series') != 'watched':
                 db.set_watch_status(series_id, 'series', 'in_progress')
 
-            # Refresh the Continue button label
             label = f"▶  Continue: S{season_num} · E{ep_num} — {ep_title}"
             self._d_continue_btn.setText(label)
             self._d_continue_btn.setVisible(True)
-
             self.status_message.emit(f"Playing: {title}")
         except FileNotFoundError as e:
             QMessageBox.critical(self, "mpv not found", str(e))
 
-    # ── Continue watching ─────────────────────────────────────────────────────
-
     def _jump_to_episode(self, season_num: str, episode_id: str, play: bool = False):
-        """Select the season and scroll to the episode. Optionally play it."""
-        # Find and select the matching season row
         target_row = 0
         for i in range(self._season_list.count()):
             if str(self._season_list.item(i).data(Qt.ItemDataRole.UserRole)) == str(season_num):
                 target_row = i
                 break
-        # setCurrentRow triggers _on_season_changed which populates _ep_list
         self._season_list.setCurrentRow(target_row)
-
-        # Find the episode row
         for i in range(self._ep_list.count()):
             it = self._ep_list.item(i)
             ep = it.data(Qt.ItemDataRole.UserRole)
@@ -601,8 +668,6 @@ class SeriesWidget(QWidget):
                     self._play_episode(it)
                 break
 
-    # ── Episode watch status ──────────────────────────────────────────────────
-
     def _ep_context_menu(self, pos):
         litem = self._ep_list.itemAt(pos)
         if not litem:
@@ -611,6 +676,7 @@ class SeriesWidget(QWidget):
         ep_id = str(ep.get('id', ''))
         menu  = QMenu(self)
         menu.addAction("▶  Play").triggered.connect(lambda: self._play_episode(litem))
+        menu.addAction("📋  Copy URL").triggered.connect(lambda: self._copy_ep_url(ep))
         menu.addSeparator()
         menu.addAction("Mark Watched").triggered.connect(
             lambda: self._set_ep_status(ep_id, 'watched', litem))
@@ -620,17 +686,25 @@ class SeriesWidget(QWidget):
             lambda: self._set_ep_status(ep_id, None, litem))
         menu.exec(self._ep_list.mapToGlobal(pos))
 
+    def _copy_ep_url(self, ep: dict):
+        if not self.api:
+            return
+        ep_id = str(ep.get('id', ''))
+        ext   = ep.get('container_extension', 'mp4')
+        url   = ep.get('stream_url') or self.api.series_url(ep_id, ext)
+        QApplication.clipboard().setText(f"'{url}'")
+        self.status_message.emit(f"Copied URL for {ep.get('title', 'episode')}")
+
     def _set_ep_status(self, ep_id: str, status, litem):
         db.set_watch_status(ep_id, 'series_ep', status)
         ep       = litem.data(Qt.ItemDataRole.UserRole)
         ep_num   = ep.get('episode_num', '?')
         ep_title = ep.get('title', f"Episode {ep_num}")
         prefix   = "✓  " if status == 'watched' else ("…  " if status == 'in_progress' else "    ")
-        label    = f"{prefix}{ep_num:>3}.  {ep_title}" if isinstance(ep_num, int) else f"{prefix}{ep_title}"
+        label    = (f"{prefix}{ep_num:>3}.  {ep_title}"
+                   if isinstance(ep_num, int) else f"{prefix}{ep_title}")
         litem.setText(label)
         litem.setData(Qt.ItemDataRole.UserRole + 1, status)
-
-    # ── Favorites ─────────────────────────────────────────────────────────────
 
     def _toggle_fav(self, item: dict):
         sid = str(item.get('series_id', ''))
@@ -642,21 +716,18 @@ class SeriesWidget(QWidget):
 
     def _update_fav_btn(self, sid: str):
         if db.is_favorite(sid, 'series'):
-            self._d_fav_btn.setText("★  Remove Favorite")
+            self._d_fav_btn.setText("♥  Favorited")
             self._d_fav_btn.setProperty('favorited', 'true')
         else:
-            self._d_fav_btn.setText("☆  Favorite")
+            self._d_fav_btn.setText("♡  Favorite")
             self._d_fav_btn.setProperty('favorited', 'false')
         self._d_fav_btn.style().unpolish(self._d_fav_btn)
         self._d_fav_btn.style().polish(self._d_fav_btn)
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
     def open_detail(self, item: dict):
-        """Navigate directly to the detail page for a given series dict (called from Favorites)."""
         self._show_detail(item)
 
-    def _show_loading(self, show):
+    def _show_loading(self, show: bool):
         self._loading.setVisible(show)
         if show:
             self._loading.resize(self.size())
@@ -664,4 +735,5 @@ class SeriesWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._loading.resize(self.size())
+        if hasattr(self, '_loading'):
+            self._loading.resize(self.size())

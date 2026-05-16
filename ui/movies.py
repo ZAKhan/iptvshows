@@ -1,16 +1,92 @@
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QApplication,
     QListWidgetItem, QLineEdit, QPushButton, QTextEdit,
-    QStackedWidget, QMessageBox, QScrollArea, QSizePolicy, QMenu,
+    QStackedWidget, QMessageBox, QScrollArea, QSizePolicy,
+    QFrame, QMenu,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut
 
-from ui.workers import ApiWorker, ImageWorker, PosterPrefetcher
-from ui.widgets import MediaListView, LoadingLabel, _placeholder
+from ui.workers import ApiWorker, ImageWorker, PosterPrefetcher, TMDBFetcher
+from ui.widgets import LoadingLabel, _placeholder, MediaListView, SearchField
+from ui.anim import apply_card_shadow
 import core.database as db
 import core.player as player
 import api.m3u as m3u
+
+
+class FilterSidebar(QWidget):
+    filter_changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(220)
+        self.setObjectName("Surface")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(16)
+
+        header = QLabel("FILTERS")
+        header.setObjectName("SectionLbl")
+        layout.addWidget(header)
+
+        sep = QFrame()
+        sep.setObjectName("HDiv")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        layout.addWidget(sep)
+
+        # Category search
+        self._cat_search = SearchField("Filter categories…")
+        self._cat_search.textChanged.connect(self._on_cat_search)
+        layout.addWidget(self._cat_search)
+
+        # Category list
+        self._cat_list = QListWidget()
+        self._cat_list.setObjectName("CategoryList")
+        self._cat_list.currentRowChanged.connect(lambda _: self.filter_changed.emit())
+        layout.addWidget(self._cat_list, stretch=1)
+
+        self._all_cats: list = []
+
+    def load_categories(self, cats: list):
+        self._all_cats = cats
+        self._render_cats(cats)
+
+    def _render_cats(self, cats: list):
+        row = self._cat_list.currentRow()
+        self._cat_list.blockSignals(True)
+        self._cat_list.clear()
+        all_item = QListWidgetItem("All Movies")
+        all_item.setData(Qt.ItemDataRole.UserRole, None)
+        self._cat_list.addItem(all_item)
+        for c in cats:
+            it = QListWidgetItem(c.get('category_name', ''))
+            it.setData(Qt.ItemDataRole.UserRole, c.get('category_id'))
+            self._cat_list.addItem(it)
+        self._cat_list.blockSignals(False)
+        if row < 0:
+            saved = db.get_setting('last_cat_vod', '')
+            target = 0
+            if saved:
+                for i in range(self._cat_list.count()):
+                    if str(self._cat_list.item(i).data(Qt.ItemDataRole.UserRole) or '') == saved:
+                        target = i
+                        break
+            self._cat_list.setCurrentRow(target)
+        else:
+            self._cat_list.setCurrentRow(row)
+
+    def _on_cat_search(self, text: str):
+        if not text:
+            self._render_cats(self._all_cats)
+        else:
+            q = text.lower()
+            self._render_cats([c for c in self._all_cats if q in c.get('category_name','').lower()])
+
+    def active_cat_id(self):
+        item = self._cat_list.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
 
 
 class MoviesWidget(QWidget):
@@ -21,89 +97,125 @@ class MoviesWidget(QWidget):
         self.api = api
         self._all_movies: list = []
         self._syncing = False
-
+        self._tmdb_worker = None
+        self._view_mode = 'all'   # 'all' | 'new'
         self._build_ui()
-        self._initial_load()   # DB only — no network
-
-    # ── Layout ────────────────────────────────────────────────────────────────
+        self._initial_load()
 
     def _build_ui(self):
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Category sidebar (always visible)
-        left = QWidget()
-        left.setFixedWidth(200)
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(0, 0, 0, 0)
-        ll.setSpacing(0)
+        if self.api is None:
+            empty = self._make_empty()
+            root.addWidget(empty)
+            return
 
-        hdr = QLabel("  Categories")
-        hdr.setFixedHeight(36)
-        hdr.setStyleSheet(
-            "background:#111;color:#888;font-size:11px;"
-            "text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid #222;"
-        )
-        ll.addWidget(hdr)
+        self._filter_sidebar = FilterSidebar()
+        self._filter_sidebar.filter_changed.connect(self._on_filter_changed)
+        root.addWidget(self._filter_sidebar)
 
-        # Fix 12: category search
-        self._cat_search = QLineEdit()
-        self._cat_search.setPlaceholderText("Filter categories…")
-        self._cat_search.setFixedHeight(28)
-        self._cat_search.setStyleSheet(
-            "background:#1a1a1a;border:none;border-bottom:1px solid #222;"
-            "color:#ccc;padding:0 8px;font-size:11px;"
-        )
-        self._cat_search.textChanged.connect(self._filter_categories)
-        ll.addWidget(self._cat_search)
+        sep = QFrame()
+        sep.setObjectName("VDiv")
+        sep.setFrameShape(QFrame.Shape.VLine)
+        root.addWidget(sep)
 
-        self._cat_list = QListWidget()
-        self._cat_list.setObjectName("CategoryList")
-        self._cat_list.currentRowChanged.connect(self._on_cat_changed)
-        ll.addWidget(self._cat_list)
-        self._all_cats: list = []
-        root.addWidget(left)
-
-        # Right side: stacked (grid ↔ detail)
+        # Right: stacked grid ↔ detail
         self._stack = QStackedWidget()
-        self._stack.addWidget(self._build_grid_page())   # index 0
-        self._stack.addWidget(self._build_detail_page()) # index 1
+        self._stack.addWidget(self._build_grid_page())
+        self._stack.addWidget(self._build_detail_page())
         root.addWidget(self._stack, stretch=1)
 
         self._loading = LoadingLabel(self)
 
+    def _make_empty(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl = QLabel("No server connected")
+        lbl.setObjectName("PlayerInfo")
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(lbl)
+        return w
+
     def _build_grid_page(self) -> QWidget:
         page = QWidget()
-        rl = QVBoxLayout(page)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.setSpacing(0)
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
 
+        # Top bar
         top = QWidget()
-        top.setFixedHeight(48)
-        top.setStyleSheet("background:#111;border-bottom:1px solid #222;")
+        top.setObjectName("TabHeader")
+        top.setFixedHeight(56)
         tl = QHBoxLayout(top)
-        tl.setContentsMargins(12, 8, 12, 8)
-        self._search = QLineEdit()
-        self._search.setPlaceholderText("🔍  Search movies…")
-        self._search.textChanged.connect(self._filter)
-        tl.addWidget(self._search)
-        self._count_lbl = QLabel("")
-        self._count_lbl.setStyleSheet("color:#555;font-size:11px;margin-right:8px;")
-        tl.addWidget(self._count_lbl)
-        self._sync_btn = QPushButton("🔄  Sync")
-        self._sync_btn.setFixedWidth(80)
-        self._sync_btn.clicked.connect(self.sync)
-        tl.addWidget(self._sync_btn)
-        rl.addWidget(top)
+        tl.setContentsMargins(20, 8, 20, 8)
+        tl.setSpacing(12)
 
-        self._grid = MediaListView()
-        self._grid.card_clicked.connect(self._show_detail)
-        self._grid.card_play.connect(self._play)
-        self._grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._grid.customContextMenuRequested.connect(self._grid_context_menu)
-        rl.addWidget(self._grid)
+        title = QLabel("Movies")
+        title.setObjectName("TabHeading")
+        tl.addWidget(title)
+
+        self._count_lbl = QLabel("")
+        self._count_lbl.setObjectName("CountLbl")
+        tl.addWidget(self._count_lbl)
+
+        tl.addSpacing(16)
+        self._seg_all = QPushButton("All")
+        self._seg_all.setObjectName("Chip")
+        self._seg_all.setProperty("active", "true")
+        self._seg_all.setFixedHeight(28)
+        self._seg_all.clicked.connect(lambda: self._set_view('all'))
+        tl.addWidget(self._seg_all)
+        self._seg_new = QPushButton("New")
+        self._seg_new.setObjectName("Chip")
+        self._seg_new.setFixedHeight(28)
+        self._seg_new.clicked.connect(lambda: self._set_view('new'))
+        tl.addWidget(self._seg_new)
+
+        tl.addStretch()
+
+        self._search = SearchField("Search movies…")
+        self._search.setMinimumWidth(160)
+        self._search.setMaximumWidth(260)
+        self._search.textChanged.connect(self._filter)
+        tl.addWidget(self._search, stretch=1)
+
+        v.addWidget(top)
+
+        self._poster_grid = MediaListView()
+        self._poster_grid.card_clicked.connect(self._show_detail)
+        self._poster_grid.card_play.connect(self._play)
+        self._poster_grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._poster_grid.customContextMenuRequested.connect(self._grid_context_menu)
+        v.addWidget(self._poster_grid, stretch=1)
         return page
+
+    def _grid_context_menu(self, pos):
+        item = self._poster_grid.itemAt(pos)
+        if not item:
+            return
+        data = item.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        menu.addAction("▶  Play").triggered.connect(lambda: self._play(data))
+        menu.addAction("📋  Copy URL").triggered.connect(lambda: self._copy_url(data))
+        menu.addSeparator()
+        sid = str(data.get('stream_id', ''))
+        fav = db.is_favorite(sid, 'vod')
+        menu.addAction("♥  Unfavorite" if fav else "♡  Favorite").triggered.connect(
+            lambda: self._toggle_fav(data)
+        )
+        menu.exec(self._poster_grid.mapToGlobal(pos))
+
+    def _copy_url(self, item: dict):
+        if not self.api:
+            return
+        sid = str(item.get('stream_id', ''))
+        ext = item.get('container_extension') or (db.get_vod_stream_data(sid) or {}).get('container_extension', 'mp4')
+        url = self.api.vod_url(sid, ext)
+        QApplication.clipboard().setText(f"'{url}'")
+        self.status_message.emit(f"Copied URL for {item.get('name', '')}")
 
     def _build_detail_page(self) -> QWidget:
         page = QWidget()
@@ -111,82 +223,79 @@ class MoviesWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Top bar with back button
         bar = QWidget()
-        bar.setFixedHeight(48)
-        bar.setStyleSheet("background:#111;border-bottom:1px solid #222;")
+        bar.setObjectName("TabHeader")
+        bar.setFixedHeight(52)
         bl = QHBoxLayout(bar)
-        bl.setContentsMargins(12, 8, 12, 8)
-        back_btn = QPushButton("← Back  [Esc]")
+        bl.setContentsMargins(20, 8, 20, 8)
+        back_btn = QPushButton("← Back")
+        back_btn.setObjectName("BackBtn")
         back_btn.clicked.connect(lambda: self._stack.setCurrentIndex(0))
-        back_btn.setFixedWidth(110)
-        bl.addWidget(back_btn)
-
-        # Fix 8/9: Esc to go back
         esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), page)
         esc.activated.connect(lambda: self._stack.setCurrentIndex(0))
-
         self._detail_title_bar = QLabel()
-        self._detail_title_bar.setStyleSheet("font-size:14px;font-weight:bold;color:#e0e0e0;padding-left:12px;")
-        self._detail_title_bar.setMaximumWidth(700)  # fix 11
+        self._detail_title_bar.setObjectName("DetailBarTitle")
+        bl.addWidget(back_btn)
         bl.addWidget(self._detail_title_bar, stretch=1)
         root.addWidget(bar)
 
-        # Content area
         content = QScrollArea()
         content.setWidgetResizable(True)
         content.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         inner = QWidget()
         cl = QHBoxLayout(inner)
-        cl.setContentsMargins(24, 24, 24, 24)
-        cl.setSpacing(24)
+        cl.setContentsMargins(28, 28, 28, 28)
+        cl.setSpacing(28)
         cl.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        # Poster
         self._d_poster = QLabel()
         self._d_poster.setFixedSize(220, 330)
         self._d_poster.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
         self._d_poster.setPixmap(_placeholder(220, 330, "🎬"))
+        self._d_poster.setStyleSheet("border-radius: 12px;")
+        apply_card_shadow(self._d_poster)
         cl.addWidget(self._d_poster, 0, Qt.AlignmentFlag.AlignTop)
 
-        # Info column
         info_col = QVBoxLayout()
-        info_col.setSpacing(10)
+        info_col.setSpacing(12)
         info_col.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         self._d_title = QLabel()
         self._d_title.setWordWrap(True)
-        self._d_title.setStyleSheet("font-size:22px;font-weight:bold;color:#e0e0e0;")
+        self._d_title.setObjectName("DetailHeading")
         info_col.addWidget(self._d_title)
 
         self._d_meta = QLabel()
-        self._d_meta.setStyleSheet("color:#888;font-size:12px;")
+        self._d_meta.setObjectName("MutedMedium")
         info_col.addWidget(self._d_meta)
 
         self._d_rating = QLabel()
-        self._d_rating.setObjectName("RatingLabel")
+        self._d_rating.setObjectName("RatingPill")
+        self._d_rating.setFixedWidth(80)
         info_col.addWidget(self._d_rating)
 
         self._d_desc = QTextEdit()
         self._d_desc.setReadOnly(True)
-        self._d_desc.setMinimumHeight(140)
-        self._d_desc.setMaximumHeight(260)
-        self._d_desc.setStyleSheet("background:#1a1a1a;border:1px solid #222;border-radius:6px;color:#bbb;padding:8px;")
+        self._d_desc.setObjectName("DetailDesc")
+        self._d_desc.setMinimumHeight(120)
+        self._d_desc.setMaximumHeight(220)
         info_col.addWidget(self._d_desc)
 
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
         self._d_play_btn = QPushButton("▶  Play")
-        self._d_play_btn.setObjectName("PlayBtn")
-        self._d_play_btn.setFixedHeight(38)
+        self._d_play_btn.setObjectName("PrimaryGradBtn")
+        self._d_play_btn.setFixedHeight(42)
         btn_row.addWidget(self._d_play_btn)
 
-        self._d_fav_btn = QPushButton("☆  Add to Favorites")
+        self._d_fav_btn = QPushButton("♡  Favorite")
         self._d_fav_btn.setObjectName("FavBtn")
-        self._d_fav_btn.setFixedHeight(38)
+        self._d_fav_btn.setFixedHeight(42)
         btn_row.addWidget(self._d_fav_btn)
 
-        self._d_watched_btn = QPushButton("✓  Mark as Watched")
-        self._d_watched_btn.setFixedHeight(38)
+        self._d_watched_btn = QPushButton("✓  Mark Watched")
+        self._d_watched_btn.setObjectName("WatchedBtn")
+        self._d_watched_btn.setFixedHeight(42)
         btn_row.addWidget(self._d_watched_btn)
         btn_row.addStretch()
         info_col.addLayout(btn_row)
@@ -197,16 +306,114 @@ class MoviesWidget(QWidget):
         root.addWidget(content, stretch=1)
         return page
 
-    # ── Sync (user-triggered only) ────────────────────────────────────────────
+    # ── Data loading ──────────────────────────────────────────────────────────
+
+    def _initial_load(self):
+        if self.api is None:
+            return
+        w = ApiWorker(db.get_vod_categories_cached)
+        w.result.connect(self._on_categories_loaded)
+        w.start()
+        self._w_cats = w
+
+    def _on_categories_loaded(self, cats):
+        if cats:
+            self._filter_sidebar.load_categories(cats)
+        self._load_from_db(None)
+
+    def _on_filter_changed(self):
+        cid = self._filter_sidebar.active_cat_id()
+        db.set_setting('last_cat_vod', str(cid) if cid else '')
+        self._load_from_db(cid)
+
+    def _load_from_db(self, cat_id):
+        if hasattr(self, '_count_lbl'):
+            self._count_lbl.setText("Loading…")
+        if self._view_mode == 'new':
+            w = ApiWorker(db.list_new_vod_streams, '')
+        else:
+            w = ApiWorker(db.list_vod_streams, cat_id)
+        w.result.connect(self._on_movies_loaded)
+        w.error.connect(lambda e: self.status_message.emit(f"DB error: {e}"))
+        w.start()
+        self._w_load = w
+
+    def _set_view(self, mode: str):
+        if mode == self._view_mode:
+            return
+        self._view_mode = mode
+        for btn, m in ((self._seg_all, 'all'), (self._seg_new, 'new')):
+            btn.setProperty('active', 'true' if m == mode else 'false')
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        q = self._search.text().strip()
+        if q:
+            self._do_search()
+        else:
+            cid = self._filter_sidebar.active_cat_id() if hasattr(self, '_filter_sidebar') else None
+            self._load_from_db(cid)
+
+    def _on_movies_loaded(self, movies):
+        self._all_movies = movies
+        q = self._search.text().strip().lower() if hasattr(self, '_search') else ''
+        display = [m for m in movies if q in m.get('name', '').lower()] if q else movies
+        self._poster_grid.load(display)
+        if hasattr(self, '_count_lbl'):
+            self._count_lbl.setText(f"{len(display):,} movies")
+        # TMDB poster fetching is now triggered manually from Settings → Playback.
+
+    def _start_tmdb_fetch(self):
+        key = db.get_setting('tmdb_api_key', '')
+        if not key or self._tmdb_worker is not None:
+            return
+        self._tmdb_worker = TMDBFetcher(key, mode='movies', parent=self)
+        self._tmdb_worker.poster_updated.connect(self._on_tmdb_poster)
+        self._tmdb_worker.finished.connect(self._on_tmdb_done)
+        self._tmdb_worker.progress.connect(
+            lambda d, t: self.status_message.emit(f"TMDB posters: {d}/{t}…")
+        )
+        self._tmdb_worker.start()
+
+    def _on_tmdb_poster(self, _kind: str, stream_id: str, url: str):
+        self._poster_grid.refresh_poster(stream_id, url)
+
+    def _on_tmdb_done(self):
+        self._tmdb_worker = None
+        self.status_message.emit("TMDB poster fetch complete.")
+
+    def _filter(self, _text: str):
+        if not hasattr(self, '_search_timer'):
+            self._search_timer = QTimer(self)
+            self._search_timer.setSingleShot(True)
+            self._search_timer.setInterval(220)
+            self._search_timer.timeout.connect(self._do_search)
+        self._search_timer.start()
+
+    def _do_search(self):
+        q = self._search.text().strip()
+        if not q:
+            self._on_search_result(self._all_movies)
+            return
+        if self._view_mode == 'new':
+            w = ApiWorker(db.list_new_vod_streams, q)
+        else:
+            w = ApiWorker(db.search_vod_streams_lite, q)
+        w.result.connect(self._on_search_result)
+        w.start()
+        self._w_search = w
+
+    def _on_search_result(self, rows):
+        self._poster_grid.load(rows)
+        self._count_lbl.setText(f"{len(rows):,} movies")
+
+    # ── Sync ──────────────────────────────────────────────────────────────────
 
     def sync(self):
-        if self._syncing:
+        """Kept for Ctrl+R / auto-sync compat — actual sync UI now lives in Settings."""
+        if self._syncing or self.api is None:
             return
         self._syncing = True
-        self._sync_btn.setText("Syncing…")
-        self._sync_btn.setEnabled(False)
         self.status_message.emit("Downloading M3U playlist…")
-
         self._w = ApiWorker(
             m3u.sync_all,
             self.api.server_url, self.api.username, self.api.password
@@ -217,151 +424,76 @@ class MoviesWidget(QWidget):
 
     def _on_sync_done(self, stats: dict):
         self._syncing = False
-        self._sync_btn.setText("🔄  Sync")
-        self._sync_btn.setEnabled(True)
-        self._populate_categories(db.get_vod_categories_cached())
-        self._load_from_db(self._active_cat_id())
+        self._filter_sidebar.load_categories(db.get_vod_categories_cached())
+        self._load_from_db(self._filter_sidebar.active_cat_id())
         n = stats.get('vod', 0)
-        self.status_message.emit(f"Synced {n} movies — fetching posters…")
-        self._start_prefetch(stats.get('vod_icons', []))
-
-    def _start_prefetch(self, urls: list):
-        self._prefetcher = PosterPrefetcher(urls, parent=self)
-        self._prefetcher.progress.connect(
-            lambda done, total: self.status_message.emit(f"Caching posters: {done}/{total}…")
+        added = stats.get('vod_added', 0)
+        removed = stats.get('vod_removed', 0)
+        self.status_message.emit(
+            f"Synced {n} movies — {added} new, {removed} removed"
         )
-        self._prefetcher.finished.connect(
-            lambda: self.status_message.emit("All posters cached.")
-        )
-        self._prefetcher.start()
+        urls = stats.get('vod_icons', [])
+        if urls:
+            self._prefetcher = PosterPrefetcher(urls, parent=self)
+            self._prefetcher.progress.connect(
+                lambda done, total: self.status_message.emit(f"Caching posters: {done}/{total}…")
+            )
+            self._prefetcher.finished.connect(
+                lambda: self.status_message.emit("All posters cached.")
+            )
+            self._prefetcher.start()
 
     def _on_sync_error(self, msg):
         self._syncing = False
-        self._sync_btn.setText("🔄  Sync")
-        self._sync_btn.setEnabled(True)
         self.status_message.emit(f"Sync error: {msg}")
 
-    # ── Categories ────────────────────────────────────────────────────────────
+    def reload_after_sync(self):
+        """Called by main_window when a settings-driven sync finishes."""
+        if not self.api:
+            return
+        self._initial_load()
 
-    def _populate_categories(self, cats):
-        self._all_cats = cats
-        self._render_categories(cats)
-
-    def _render_categories(self, cats):
-        current = self._cat_list.currentRow()
-        self._cat_list.blockSignals(True)
-        self._cat_list.clear()
-        all_item = QListWidgetItem("All Movies")
-        all_item.setData(Qt.ItemDataRole.UserRole, None)
-        self._cat_list.addItem(all_item)
-        for cat in cats:
-            item = QListWidgetItem(cat.get('category_name', ''))
-            item.setData(Qt.ItemDataRole.UserRole, cat.get('category_id'))
-            self._cat_list.addItem(item)
-        self._cat_list.blockSignals(False)
-        self._cat_list.setCurrentRow(max(current, 0))
-        if current < 0:
-            self._load_from_db(None)
-
-    def _filter_categories(self, text: str):
-        if not text:
-            self._render_categories(self._all_cats)
-        else:
-            q = text.lower()
-            filtered = [c for c in self._all_cats
-                        if q in c.get('category_name', '').lower()]
-            self._render_categories(filtered)
-
-    def _on_cat_changed(self, row):
-        item = self._cat_list.item(row)
-        if item:
-            self._load_from_db(item.data(Qt.ItemDataRole.UserRole))
-            self._stack.setCurrentIndex(0)
-
-    def _initial_load(self):
-        cats = db.get_vod_categories_cached()
-        if cats:
-            self._populate_categories(cats)
-        else:
-            self._count_lbl.setText("No data — click Sync")
-
-    def _active_cat_id(self):
-        item = self._cat_list.currentItem()
-        return item.data(Qt.ItemDataRole.UserRole) if item else None
-
-    # ── Grid ──────────────────────────────────────────────────────────────────
-
-    def _load_from_db(self, cat_id):
-        movies = db.get_vod_streams_cached(cat_id)
-        self._all_movies = movies
-        self._show_loading(False)
-        q = self._search.text().strip().lower()
-        display = [m for m in movies if q in m.get('name','').lower()] if q else movies
-        self._attach_statuses(display, 'vod', 'stream_id')
-        self._grid.load(display)
-        self._count_lbl.setText(f"{len(self._all_movies)} movies")
-
-    def _filter(self, text):
-        q = text.strip()
-        if q:
-            filtered = db.search_vod_streams(q)
-        else:
-            filtered = self._all_movies
-        self._attach_statuses(filtered, 'vod', 'stream_id')
-        self._grid.load(filtered)
-        self._count_lbl.setText(f"{len(filtered)} movies")
-
-    def _attach_statuses(self, items: list, stream_type: str, id_key: str):
-        ids = [str(m.get(id_key, '')) for m in items]
-        statuses = db.bulk_get_watch_statuses(ids, stream_type)
-        for m in items:
-            m['_watch_status'] = statuses.get(str(m.get(id_key, '')))
-
-    # ── Detail panel ──────────────────────────────────────────────────────────
+    # ── Detail ────────────────────────────────────────────────────────────────
 
     def _show_detail(self, item: dict):
-        self._current_item = item
         sid = str(item.get('stream_id', ''))
+        # Lite list rows lack full metadata — hydrate from JSON blob
+        full = db.get_vod_stream_data(sid)
+        if full:
+            full['_watch_status'] = item.get('_watch_status')
+            item = full
+        self._current_item = item
 
         self._detail_title_bar.setText(item.get('name', ''))
         self._d_title.setText(item.get('name', ''))
 
-        r = item.get('rating') or item.get('rating_5based', '')
-        self._d_rating.setText(f"⭐ {r}" if r else "")
+        r = str(item.get('rating') or item.get('rating_5based', '') or '')
+        self._d_rating.setText(f"★ {r}" if r and r not in ('None','0','0.0') else "")
 
         meta_parts = []
-        if item.get('year'):       meta_parts.append(str(item['year']))
-        if item.get('genre'):      meta_parts.append(item['genre'])
-        if item.get('duration'):   meta_parts.append(item['duration'])
+        if item.get('year'):     meta_parts.append(str(item['year']))
+        if item.get('genre'):    meta_parts.append(item['genre'])
+        if item.get('duration'): meta_parts.append(item['duration'])
         self._d_meta.setText("  ·  ".join(meta_parts))
-
         self._d_desc.setPlainText("Loading…")
         self._d_poster.setPixmap(_placeholder(220, 330, "🎬"))
 
-        # Fix 2: safe disconnect before reconnecting
-        try:
-            self._d_play_btn.clicked.disconnect()
-        except TypeError:
-            pass
+        try: self._d_play_btn.clicked.disconnect()
+        except TypeError: pass
         self._d_play_btn.clicked.connect(lambda: self._play(item))
 
-        try:
-            self._d_fav_btn.clicked.disconnect()
-        except TypeError:
-            pass
+        try: self._d_fav_btn.clicked.disconnect()
+        except TypeError: pass
         self._update_fav_btn(sid)
         self._d_fav_btn.clicked.connect(lambda: self._toggle_fav(item))
 
-        try:
-            self._d_watched_btn.clicked.disconnect()
-        except TypeError:
-            pass
+        try: self._d_watched_btn.clicked.disconnect()
+        except TypeError: pass
         self._update_watched_btn(sid)
         self._d_watched_btn.clicked.connect(lambda: self._cycle_watched(item))
 
         self._stack.setCurrentIndex(1)
 
-        # Async: poster + info
         url = item.get('stream_icon') or item.get('cover', '')
         if url:
             w = ImageWorker(url, size=(220, 330))
@@ -369,15 +501,18 @@ class MoviesWidget(QWidget):
             w.start()
             self._pw = w
 
-        w2 = ApiWorker(self.api.get_vod_info, sid)
-        w2.result.connect(self._on_detail_info)
-        w2.error.connect(lambda _: self._d_desc.setPlainText("No description available."))
-        w2.start()
-        self._iw = w2
+        if self.api:
+            w2 = ApiWorker(self.api.get_vod_info, sid)
+            w2.result.connect(self._on_detail_info)
+            w2.error.connect(lambda _: self._d_desc.setPlainText("No description available."))
+            w2.start()
+            self._iw = w2
 
     def _on_detail_info(self, data: dict):
         info = data.get('info', {})
-        self._d_desc.setPlainText(info.get('description') or info.get('plot', '') or "No description available.")
+        self._d_desc.setPlainText(
+            info.get('description') or info.get('plot', '') or "No description available."
+        )
         cover = info.get('movie_image') or info.get('cover_big', '')
         if cover:
             w = ImageWorker(cover, size=(220, 330))
@@ -388,8 +523,10 @@ class MoviesWidget(QWidget):
     # ── Playback / favorites ──────────────────────────────────────────────────
 
     def _play(self, item: dict):
+        if not self.api:
+            return
         sid  = str(item.get('stream_id', ''))
-        ext  = item.get('container_extension', 'mp4')
+        ext  = item.get('container_extension') or (db.get_vod_stream_data(sid) or {}).get('container_extension', 'mp4')
         url  = self.api.vod_url(sid, ext)
         name = item.get('name', 'Movie')
         try:
@@ -397,57 +534,10 @@ class MoviesWidget(QWidget):
             db.add_history(sid, 'vod', name, item.get('stream_icon', ''))
             if db.get_watch_status(sid, 'vod') != 'watched':
                 db.set_watch_status(sid, 'vod', 'in_progress')
-                self._refresh_grid_badge(sid)
                 self._update_watched_btn(sid)
             self.status_message.emit(f"Playing: {name}")
         except FileNotFoundError as e:
             QMessageBox.critical(self, "mpv not found", str(e))
-
-    def _grid_context_menu(self, pos):
-        it = self._grid.itemAt(pos)
-        if not it:
-            return
-        data = it.data(Qt.ItemDataRole.UserRole)
-        sid = str(data.get('stream_id', ''))
-        menu = QMenu(self)
-        menu.addAction("Mark Watched").triggered.connect(
-            lambda: self._set_grid_status(sid, 'watched', it))
-        menu.addAction("Mark In Progress").triggered.connect(
-            lambda: self._set_grid_status(sid, 'in_progress', it))
-        menu.addAction("Clear Status").triggered.connect(
-            lambda: self._set_grid_status(sid, None, it))
-        menu.exec(self._grid.mapToGlobal(pos))
-
-    def _set_grid_status(self, sid: str, status, list_item):
-        db.set_watch_status(sid, 'vod', status)
-        list_item.setData(Qt.ItemDataRole.UserRole + 2, status)
-        self._grid.update(self._grid.indexFromItem(list_item))
-
-    def _refresh_grid_badge(self, sid: str):
-        status = db.get_watch_status(sid, 'vod')
-        for i in range(self._grid.count()):
-            it = self._grid.item(i)
-            if str(it.data(Qt.ItemDataRole.UserRole).get('stream_id', '')) == sid:
-                it.setData(Qt.ItemDataRole.UserRole + 2, status)
-                self._grid.update(self._grid.indexFromItem(it))
-                break
-
-    def _cycle_watched(self, item: dict):
-        sid = str(item.get('stream_id', ''))
-        current = db.get_watch_status(sid, 'vod')
-        new_status = None if current == 'watched' else 'watched'
-        db.set_watch_status(sid, 'vod', new_status)
-        self._update_watched_btn(sid)
-        self._refresh_grid_badge(sid)
-
-    def _update_watched_btn(self, sid: str):
-        status = db.get_watch_status(sid, 'vod')
-        if status == 'watched':
-            self._d_watched_btn.setText("✓  Watched")
-        elif status == 'in_progress':
-            self._d_watched_btn.setText("…  In Progress  ·  Mark Watched")
-        else:
-            self._d_watched_btn.setText("✓  Mark as Watched")
 
     def _toggle_fav(self, item: dict):
         sid = str(item.get('stream_id', ''))
@@ -459,21 +549,33 @@ class MoviesWidget(QWidget):
 
     def _update_fav_btn(self, sid: str):
         if db.is_favorite(sid, 'vod'):
-            self._d_fav_btn.setText("★  Remove Favorite")
+            self._d_fav_btn.setText("♥  Favorited")
             self._d_fav_btn.setProperty('favorited', 'true')
         else:
-            self._d_fav_btn.setText("☆  Add to Favorites")
+            self._d_fav_btn.setText("♡  Favorite")
             self._d_fav_btn.setProperty('favorited', 'false')
         self._d_fav_btn.style().unpolish(self._d_fav_btn)
         self._d_fav_btn.style().polish(self._d_fav_btn)
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _cycle_watched(self, item: dict):
+        sid = str(item.get('stream_id', ''))
+        current = db.get_watch_status(sid, 'vod')
+        db.set_watch_status(sid, 'vod', None if current == 'watched' else 'watched')
+        self._update_watched_btn(sid)
+
+    def _update_watched_btn(self, sid: str):
+        status = db.get_watch_status(sid, 'vod')
+        if status == 'watched':
+            self._d_watched_btn.setText("✓  Watched")
+        elif status == 'in_progress':
+            self._d_watched_btn.setText("…  In Progress")
+        else:
+            self._d_watched_btn.setText("✓  Mark Watched")
 
     def open_detail(self, item: dict):
-        """Navigate directly to the detail page for a given movie dict (called from Favorites)."""
         self._show_detail(item)
 
-    def _show_loading(self, show):
+    def _show_loading(self, show: bool):
         self._loading.setVisible(show)
         if show:
             self._loading.resize(self.size())
@@ -481,4 +583,5 @@ class MoviesWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._loading.resize(self.size())
+        if hasattr(self, '_loading'):
+            self._loading.resize(self.size())
