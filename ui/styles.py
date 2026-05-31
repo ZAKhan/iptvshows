@@ -11,8 +11,15 @@ QMainWindow, QDialog, QWidget {
 #Sidebar {
     background-color: #121216;
     border-right: 1px solid #232329;
-    min-width: 180px;
-    max-width: 180px;
+}
+
+#SidebarToggle {
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+}
+#SidebarToggle:hover {
+    background-color: #18181d;
 }
 
 /* ── Brand mark ─────────────────────────────────────────────────────────────── */
@@ -70,6 +77,16 @@ QPushButton#NavItem[active="true"], QPushButton#NavBtn[active="true"] {
     color: #ffb547;
     border-left: 2px solid #ffb547;
     padding-left: 10px;
+}
+QPushButton#NavItem[collapsed="true"] {
+    text-align: center;
+    padding: 9px 0;
+    margin: 1px 8px;
+}
+QPushButton#NavItem[collapsed="true"][active="true"] {
+    padding-left: 0;
+    border-left: none;
+    border-right: 2px solid #ffb547;
 }
 
 /* ── Top bar ────────────────────────────────────────────────────────────────── */
@@ -707,13 +724,16 @@ QLabel#ServerStatus { color: #6b6960; font-size: 12px; padding: 0; }
 QProgressBar#BottomProgress {
     background-color: #232329;
     border: none;
-    border-radius: 3px;
-    max-height: 6px;
+    border-radius: 9px;
+    color: #1a1004;
+    font-size: 11px;
+    font-weight: 700;
+    text-align: center;
 }
 QProgressBar#BottomProgress::chunk {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
         stop:0 #ffb547, stop:1 #ff7a1a);
-    border-radius: 3px;
+    border-radius: 9px;
 }
 
 /* ── Tab widget (fallback) ──────────────────────────────────────────────────── */

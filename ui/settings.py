@@ -561,6 +561,7 @@ class SettingsWidget(QWidget):
         self._sync_worker = SyncWorker(url, user, pw, parent=self)
         # Explicit slot — PyQt6 signal-to-signal sometimes drops cross-thread.
         self._sync_worker.progress.connect(self._forward_sync_progress)
+        self._sync_worker.status.connect(self.status_message)
         self._sync_worker.result.connect(lambda stats, s=srv: self._on_sync_done(s, stats))
         self._sync_worker.error.connect(
             lambda e, s=srv: self._on_sync_error(s, e)

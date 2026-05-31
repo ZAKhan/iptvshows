@@ -27,6 +27,7 @@ _RUNNING_WORKERS: set = set()
 class SyncWorker(QThread):
     """Dedicated worker for m3u.sync_all that surfaces stage progress."""
     progress = pyqtSignal(int, int)
+    status   = pyqtSignal(str)
     result   = pyqtSignal(object)
     error    = pyqtSignal(str)
 
@@ -44,13 +45,18 @@ class SyncWorker(QThread):
         try: self.progress.emit(done, total)
         except RuntimeError: pass
 
+    def _status_cb(self, text: str):
+        try: self.status.emit(text)
+        except RuntimeError: pass
+
     def run(self):
         import logging
         log = logging.getLogger("iptvshows.sync")
         from api import m3u
         try:
             log.info("SyncWorker start url=%s user=%s", self._args[0], self._args[1])
-            stats = m3u.sync_all(*self._args, progress_cb=self._cb)
+            stats = m3u.sync_all(*self._args, progress_cb=self._cb,
+                                 status_cb=self._status_cb)
             log.info("SyncWorker done stats=%s", stats)
             self.result.emit(stats)
         except Exception as exc:

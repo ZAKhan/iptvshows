@@ -36,6 +36,7 @@ def _bulk_search(query: str) -> dict:
 
 class SearchWidget(QWidget):
     status_message = pyqtSignal(str)
+    navigate_to = pyqtSignal(str, dict)
 
     def __init__(self, api, parent=None):
         super().__init__(parent)
@@ -134,8 +135,5 @@ class SearchWidget(QWidget):
 
     def _show_series(self, item: dict):
         sid = str(item.get('series_id', ''))
-        full = db.get_series_data(sid)
-        if full:
-            from ui.series import SeriesDetailDialog
-            dlg = SeriesDetailDialog(full, self.api, self)
-            dlg.exec()
+        full = db.get_series_data(sid) or item
+        self.navigate_to.emit('series', full)

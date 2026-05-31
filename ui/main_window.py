@@ -1,37 +1,65 @@
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QStackedWidget, QStatusBar,
-    QSizePolicy, QFrame, QScrollArea, QProgressBar,
+    QSizePolicy, QFrame, QScrollArea,
 )
 from ui.widgets import SearchField
 from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from PyQt6.QtGui import QFont, QKeySequence, QShortcut
 
 from ui.styles import DARK_THEME
+from ui.icons import icon as svg_icon
 import core.database as db
 from api.xtream import XtreamAPI
 
 NAV_ITEMS = [
-    ("home",      "Home",      "Home"),
-    ("tv",        "Live TV",   "Live TV"),
-    ("film",      "Movies",    "Movies"),
-    ("list-video","Series",    "Series"),
-    ("search",    "Search",    "Search"),
-    ("heart",     "Favorites", "Favorites"),
-    ("settings",  "Settings",  "Settings"),
+    ("home",      "Home",      "Home",      "#7dd3fc"),
+    ("tv",        "Live TV",   "Live TV",   "#f87171"),
+    ("film",      "Movies",    "Movies",    "#c084fc"),
+    ("list-video","Series",    "Series",    "#34d399"),
+    ("search",    "Search",    "Search",    "#fbbf24"),
+    ("heart",     "Favorites", "Favorites", "#f472b6"),
+    ("settings",  "Settings",  "Settings",  "#94a3b8"),
 ]
+
+SIDEBAR_EXPANDED_WIDTH = 200
+SIDEBAR_COLLAPSED_WIDTH = 64
 
 
 class NavButton(QPushButton):
-    def __init__(self, label: str, parent=None):
-        super().__init__(label, parent)
+    def __init__(self, icon_name: str, label: str, color: str = "#a8a59c", parent=None):
+        super().__init__(parent)
         self.setObjectName("NavItem")
         self.setFixedHeight(40)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setCheckable(False)
+        self._icon_name = icon_name
+        self._label = label
+        self._collapsed = False
+        self._icon_normal = svg_icon(icon_name, color, 18)
+        self._icon_active = svg_icon(icon_name, color, 18)
+        self.setIcon(self._icon_normal)
+        self.setIconSize(QSize(18, 18))
+        self.setText(f"  {label}")
 
     def set_active(self, active: bool):
         self.setProperty("active", "true" if active else "false")
+        self.setIcon(self._icon_active if active else self._icon_normal)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def set_collapsed(self, collapsed: bool):
+        if collapsed == self._collapsed:
+            return
+        self._collapsed = collapsed
+        if collapsed:
+            self.setText("")
+            self.setToolTip(self._label)
+            self.setProperty("collapsed", "true")
+        else:
+            self.setText(f"  {self._label}")
+            self.setToolTip("")
+            self.setProperty("collapsed", "false")
         self.style().unpolish(self)
         self.style().polish(self)
 
@@ -134,8 +162,8 @@ class TopBar(QFrame):
 
 
 class BottomBar(QFrame):
-    """Custom bottom bar replacing QStatusBar.
-    Left: server status label. Center: progress bar (visible during sync). Right: status message."""
+    """Custom bottom bar.
+    Left: server status. Right: status message ("Syncing…" / final summary)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -153,38 +181,28 @@ class BottomBar(QFrame):
 
         layout.addStretch()
 
-        self.progress = QProgressBar()
-        self.progress.setObjectName("BottomProgress")
-        self.progress.setFixedSize(220, 6)
-        self.progress.setTextVisible(False)
-        self.progress.setRange(0, 100)
-        self.progress.hide()
-        layout.addWidget(self.progress)
-
         self.msg_lbl = QLabel("")
         self.msg_lbl.setObjectName("StatusMsg")
         layout.addWidget(self.msg_lbl)
 
+        self._syncing = False
+
     def showMessage(self, text: str, _timeout: int = 0):
+        if self._syncing:
+            return
         self.msg_lbl.setText(text or "")
 
     def show_busy(self):
-        """Indeterminate (sweeping) progress."""
-        self.progress.setRange(0, 0)
-        self.progress.show()
+        self._syncing = True
+        self.msg_lbl.setText("Syncing…")
 
-    def set_progress(self, done: int, total: int):
-        if total <= 0:
-            self.show_busy()
-            return
-        self.progress.setRange(0, total)
-        self.progress.setValue(done)
-        self.progress.show()
+    def set_progress(self, _done: int, _total: int):
+        self._syncing = True
+        self.msg_lbl.setText("Syncing…")
 
     def hide_progress(self):
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.progress.hide()
+        self._syncing = False
+        self.msg_lbl.setText("")
 
 
 class MainWindow(QMainWindow):
@@ -210,7 +228,7 @@ class MainWindow(QMainWindow):
         sc = QShortcut(QKeySequence("Ctrl+Q"), self)
         sc.activated.connect(lambda: __import__('os')._exit(0))
         # Ctrl+1..7 → nav items
-        for i, (_icon, _label, page_key) in enumerate(NAV_ITEMS, start=1):
+        for i, (_icon, _label, page_key, _color) in enumerate(NAV_ITEMS, start=1):
             sc = QShortcut(QKeySequence(f"Ctrl+{i}"), self)
             sc.activated.connect(lambda k=page_key: self._nav_to(k))
         # Ctrl+R → trigger sync on current page if available
@@ -264,28 +282,38 @@ class MainWindow(QMainWindow):
         root.setSpacing(0)
 
         # ── Sidebar ──────────────────────────────────────────────────────────
-        sidebar = QFrame()
-        sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(180)
-        sb = QVBoxLayout(sidebar)
+        self._sidebar = QFrame()
+        self._sidebar.setObjectName("Sidebar")
+        self._sidebar.setFixedWidth(SIDEBAR_EXPANDED_WIDTH)
+        sb = QVBoxLayout(self._sidebar)
         sb.setContentsMargins(0, 0, 0, 0)
         sb.setSpacing(0)
 
-        # Brand
+        # Brand + toggle
         brand_row = QWidget()
         brand_row.setFixedHeight(64)
         brand_row.setStyleSheet("background: transparent;")
-        br = QHBoxLayout(brand_row)
-        br.setContentsMargins(16, 0, 16, 0)
+        self._brand_row_layout = QHBoxLayout(brand_row)
+        br = self._brand_row_layout
+        br.setContentsMargins(16, 0, 8, 0)
         br.setSpacing(10)
-        mark = QPushButton("▶")
-        mark.setObjectName("BrandMark")
-        mark.setEnabled(False)
-        name_lbl = QLabel("IPTV Player")
-        name_lbl.setObjectName("BrandName")
-        br.addWidget(mark)
-        br.addWidget(name_lbl)
+        self._brand_mark = QPushButton("▶")
+        self._brand_mark.setObjectName("BrandMark")
+        self._brand_mark.setEnabled(False)
+        self._brand_name = QLabel("IPTV Player")
+        self._brand_name.setObjectName("BrandName")
+        self._toggle_btn = QPushButton()
+        self._toggle_btn.setObjectName("SidebarToggle")
+        self._toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._toggle_btn.setFixedSize(32, 32)
+        self._toggle_btn.setIcon(svg_icon("panel-left", "#a8a59c", 18))
+        self._toggle_btn.setIconSize(QSize(18, 18))
+        self._toggle_btn.setToolTip("Collapse sidebar")
+        self._toggle_btn.clicked.connect(self._toggle_sidebar)
+        br.addWidget(self._brand_mark)
+        br.addWidget(self._brand_name)
         br.addStretch()
+        br.addWidget(self._toggle_btn)
         sb.addWidget(brand_row)
 
         # Separator
@@ -298,14 +326,18 @@ class MainWindow(QMainWindow):
 
         # Nav items
         self._nav_btns: dict[str, NavButton] = {}
-        for _icon, label, page_key in NAV_ITEMS:
-            btn = NavButton(f"  {label}")
+        for icon_name, label, page_key, color in NAV_ITEMS:
+            btn = NavButton(icon_name, label, color)
             btn.clicked.connect(lambda checked, k=page_key: self._nav_to(k))
             sb.addWidget(btn)
             self._nav_btns[page_key] = btn
 
         sb.addStretch()
-        root.addWidget(sidebar)
+        root.addWidget(self._sidebar)
+
+        self._sidebar_collapsed = db.get_setting('sidebar_collapsed', '0') == '1'
+        if self._sidebar_collapsed:
+            self._apply_sidebar_state()
 
         # ── Right column: topbar + page stack ────────────────────────────────
         right = QWidget()
@@ -333,7 +365,7 @@ class MainWindow(QMainWindow):
 
         # Placeholder pages (replaced after _init_pages)
         self._pages: dict[str, QWidget] = {}
-        for _icon, _label, page_key in NAV_ITEMS:
+        for _icon, _label, page_key, _color in NAV_ITEMS:
             ph = self._make_empty_state()
             self._pages[page_key] = ph
             self._stack.addWidget(ph)
@@ -525,6 +557,24 @@ class MainWindow(QMainWindow):
             self._stack.setCurrentWidget(page)
         for key, btn in self._nav_btns.items():
             btn.set_active(key == page_key)
+
+    def _toggle_sidebar(self):
+        self._sidebar_collapsed = not self._sidebar_collapsed
+        db.set_setting('sidebar_collapsed', '1' if self._sidebar_collapsed else '0')
+        self._apply_sidebar_state()
+
+    def _apply_sidebar_state(self):
+        collapsed = self._sidebar_collapsed
+        self._sidebar.setFixedWidth(SIDEBAR_COLLAPSED_WIDTH if collapsed else SIDEBAR_EXPANDED_WIDTH)
+        self._brand_name.setVisible(not collapsed)
+        self._brand_mark.setVisible(not collapsed)
+        if collapsed:
+            self._brand_row_layout.setContentsMargins(16, 0, 16, 0)
+        else:
+            self._brand_row_layout.setContentsMargins(16, 0, 8, 0)
+        self._toggle_btn.setToolTip("Expand sidebar" if collapsed else "Collapse sidebar")
+        for btn in self._nav_btns.values():
+            btn.set_collapsed(collapsed)
 
     # ── Geometry ──────────────────────────────────────────────────────────────
 

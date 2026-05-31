@@ -311,13 +311,18 @@ def get_live_categories_cached() -> List[Dict]:
 
 # ── Live streams ──────────────────────────────────────────────────────────────
 
-def save_live_streams(streams: List[Dict]) -> Dict[str, int]:
+_SAVE_BATCH = 2000
+
+
+def save_live_streams(streams: List[Dict], progress_cb=None, status_cb=None) -> Dict[str, int]:
+    total = len(streams)
     with _get_conn() as conn:
         before = {r[0] for r in conn.execute("SELECT stream_id FROM live_streams")}
         conn.execute("DELETE FROM live_streams")
-        conn.executemany(
-            "INSERT OR REPLACE INTO live_streams (stream_id, name, category_id, stream_icon, num, data) VALUES (?,?,?,?,?,?)",
-            [
+        sql = "INSERT OR REPLACE INTO live_streams (stream_id, name, category_id, stream_icon, num, data) VALUES (?,?,?,?,?,?)"
+        for i in range(0, total, _SAVE_BATCH):
+            batch = streams[i:i+_SAVE_BATCH]
+            conn.executemany(sql, [
                 (
                     str(s.get('stream_id', '')),
                     s.get('name', ''),
@@ -326,9 +331,15 @@ def save_live_streams(streams: List[Dict]) -> Dict[str, int]:
                     s.get('num', 0),
                     json.dumps(s),
                 )
-                for s in streams
-            ]
-        )
+                for s in batch
+            ])
+            done = min(i + _SAVE_BATCH, total)
+            if progress_cb:
+                try: progress_cb(done, total)
+                except Exception: pass
+            if status_cb:
+                try: status_cb(f"Saving live channels: {done:,} / {total:,}")
+                except Exception: pass
         after = {str(s.get('stream_id', '')) for s in streams}
         added = after - before
         now = time.time()
@@ -381,13 +392,18 @@ def get_vod_categories_cached() -> List[Dict]:
 
 # ── VOD streams ───────────────────────────────────────────────────────────────
 
-def save_vod_streams(streams: List[Dict]) -> Dict[str, int]:
+def save_vod_streams(streams: List[Dict], progress_cb=None, status_cb=None) -> Dict[str, int]:
+    total = len(streams)
     with _get_conn() as conn:
+        if progress_cb:
+            try: progress_cb(1, max(total, 1))
+            except Exception: pass
         before = {r[0] for r in conn.execute("SELECT stream_id FROM vod_streams")}
         conn.execute("DELETE FROM vod_streams")
-        conn.executemany(
-            "INSERT OR REPLACE INTO vod_streams (stream_id, name, category_id, stream_icon, rating, data) VALUES (?,?,?,?,?,?)",
-            [
+        sql = "INSERT OR REPLACE INTO vod_streams (stream_id, name, category_id, stream_icon, rating, data) VALUES (?,?,?,?,?,?)"
+        for i in range(0, total, _SAVE_BATCH):
+            batch = streams[i:i+_SAVE_BATCH]
+            conn.executemany(sql, [
                 (
                     str(s.get('stream_id', '')),
                     s.get('name', ''),
@@ -396,9 +412,15 @@ def save_vod_streams(streams: List[Dict]) -> Dict[str, int]:
                     str(s.get('rating', '') or s.get('rating_5based', '')),
                     json.dumps(s),
                 )
-                for s in streams
-            ]
-        )
+                for s in batch
+            ])
+            done = min(i + _SAVE_BATCH, total)
+            if progress_cb:
+                try: progress_cb(done, total)
+                except Exception: pass
+            if status_cb:
+                try: status_cb(f"Saving movies: {done:,} / {total:,}")
+                except Exception: pass
         after = {str(s.get('stream_id', '')) for s in streams}
         added = after - before
         now = time.time()
@@ -451,13 +473,15 @@ def get_series_categories_cached() -> List[Dict]:
 
 # ── Series list ───────────────────────────────────────────────────────────────
 
-def save_series_list(series: List[Dict]) -> Dict[str, int]:
+def save_series_list(series: List[Dict], progress_cb=None, status_cb=None) -> Dict[str, int]:
+    total = len(series)
     with _get_conn() as conn:
         before = {r[0] for r in conn.execute("SELECT series_id FROM series_list")}
         conn.execute("DELETE FROM series_list")
-        conn.executemany(
-            "INSERT OR REPLACE INTO series_list (series_id, name, category_id, cover, rating, data) VALUES (?,?,?,?,?,?)",
-            [
+        sql = "INSERT OR REPLACE INTO series_list (series_id, name, category_id, cover, rating, data) VALUES (?,?,?,?,?,?)"
+        for i in range(0, total, _SAVE_BATCH):
+            batch = series[i:i+_SAVE_BATCH]
+            conn.executemany(sql, [
                 (
                     str(s.get('series_id', '')),
                     s.get('name', ''),
@@ -466,9 +490,15 @@ def save_series_list(series: List[Dict]) -> Dict[str, int]:
                     str(s.get('rating', '') or s.get('rating_5based', '')),
                     json.dumps(s),
                 )
-                for s in series
-            ]
-        )
+                for s in batch
+            ])
+            done = min(i + _SAVE_BATCH, total)
+            if progress_cb:
+                try: progress_cb(done, total)
+                except Exception: pass
+            if status_cb:
+                try: status_cb(f"Saving series: {done:,} / {total:,}")
+                except Exception: pass
         after = {str(s.get('series_id', '')) for s in series}
         added = after - before
         now = time.time()
